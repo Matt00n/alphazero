@@ -15,6 +15,15 @@ class Policy(Protocol):
       key: jnp.ndarray,
   ) -> Tuple[jnp.ndarray, Mapping[str, Any]]:
     pass
+
+
+class ForwardPass(Protocol):
+
+  def __call__(
+      self,
+      observation: jnp.ndarray,
+  ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    pass
   
 
 class NetworkFactory(Protocol[NetworkType]):

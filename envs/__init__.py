@@ -4,7 +4,7 @@ from envs.batched_env import SequencedBatchedEnv, ParallelBatchedEnv
 from envs.normalize import VecNormalize
 from envs.make_env import make_env
 from envs.state import State
-from envs.transition import Transition
+from envs.transition import Transition, MCTSTransition
 from envs.evaluate import RecordScores, Evaluator
 from gymnax.gymnax.environments.spaces import Discrete
 

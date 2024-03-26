@@ -7,18 +7,27 @@
 # (TODO ENV: atari wrappers, atari networks, change MinAtar envs)
 # TODO ENV: visualizer
 # (TODO ENV: Option for passing env params to all functions which step env)
-# TODO: Blueprint of all Muzero elements
-# TODO MCTS: Adapt policy learning
+# DONE Blueprint of all Muzero elements
+# DONE MCTS: Adapt policy learning
 # TODO MCTS: Learn Model
 # TODO MCTS: Replay Buffers from Brax (logic for prefilling buffer before training)
 # TODO MCTS: keep options for both replay & rollout buffer --> test to see what works better in target use case
 # TODO MCTS: option for different MCTS versions from MCTX
-# TODO HIGH IMPORTANCE: Auto reset not wanted in MCTS rollouts!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# NOT NEEDED (handled internally by mcts via discounts): Auto reset not wanted in MCTS rollouts
 # TODO: System adapted from EfficientZero
-# TODO: Adapt implementation details from further papers: EfficientZero, Sampled Muzero, Gumble Muzero, AlphaTensor, AlphaDev, DreamerV3
+# TODO: Adapt implementation details from further papers: EfficientZero, Reanalyze, Sampled Muzero, Gumble Muzero, AlphaTensor, AlphaDev, DreamerV3
 # TODO: look into running jax on (M1) GPU: Gymnax, Jax docs, Jax M1
 # TODO: clean up and organize code / folders
-# TODO: Test with Gymnax environments
+# DONE Test with Gymnax environments
+# TODO pass in mcts policy as argument so that we can partial it before
+# TODO make eval deterministic (as option) for non gumbel version
+# TODO potentially change generate unroll to generate episodes (remove auto reset and reset manually after unroll)
+
+# Optional / future research
+# TODO incorporate GAE into tree search to construct targets
+# TODO Distributional RL incorporated in MCTS
+# TODO MCTS replay vs rollout buffer
+
 
 
 from absl import logging, app
@@ -33,25 +42,30 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Union
 #     "XLA_PYTHON_CLIENT_MEM_FRACTION"
 # ] = "0.7"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
+import chex
 import flax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import tensorflow_probability.substrates.jax.distributions as tfd # TODO: can be removed once transitioned to AZ loss
 
-from envs import make_env, Transition, has_discrete_action_space, is_atari_env
+from envs import make_env, Transition, MCTSTransition, has_discrete_action_space, is_atari_env
 # from envs.brax_v1_wrappers import wrap_for_training
 from envs.brax_wrappers import EvalWrapper, wrap_for_training
-from networks.policy import Policy
+from networks.policy import Policy, ForwardPass
 from networks.networks import FeedForwardNetwork, ActivationFn, make_policy_network, make_value_network, make_atari_feature_extractor
 from networks.distributions import NormalTanhDistribution, ParametricDistribution, PolicyNormalDistribution, DiscreteDistribution
+import replay_buffers
 import running_statistics
 from gymnax import gymnax
 from gymnax.gymnax.wrappers.brax import GymnaxToBraxWrapper, State
 import mctx
 
 class Config:
+    # TODO BUFFER update configs
+
     # experiment
     experiment_name = 'ppo_test'
     seed = 30
@@ -62,8 +76,8 @@ class Config:
     save_scores = False
 
     # environment
-    env_id = 'Breakout-MinAtar' # CartPole-v1, Breakout-MinAtar
-    num_envs = 16
+    env_id = 'CartPole-v1' # CartPole-v1, Breakout-MinAtar
+    num_envs = 8
     normalize_observations = True 
     action_repeat = 1
     eval_env = True
@@ -71,29 +85,28 @@ class Config:
     eval_every = 1
     deterministic_eval = True
     num_eval_envs = 64
-    episode_length = 1000
+    episode_length = 500
 
     # MCTS
-    num_simulations = 10
+    num_simulations = 30
     max_num_considered_actions = 16
+    l2_coef = 1e-4
+    vf_cost = 0.5
+
+    # replay buffer
+    min_replay_size: int = 0
+    max_replay_size: Optional[int] = 16384
+    replay_buffer_batch_size: int = 256
 
     # algorithm hyperparameters
     total_timesteps = int(1e6) 
     learning_rate = 1e-3 # 3e-4 
-    unroll_length = 128 
+    unroll_length = 2048 
     anneal_lr = True
-    gamma = 0.99 
-    gae_lambda = 0.95
-    batch_size = 1 # number of unrolls per minibatch 
-    num_minibatches = 64
-    update_epochs = 10
-    normalize_advantages = True
-    clip_eps = 0.2
-    entropy_cost = 0.001
-    vf_cost = 0.5
+    num_minibatches = 1
+    update_epochs = 1 # 10
     max_grad_norm = 0.5
-    target_kl = None
-    reward_scaling = 1. 
+    grad_updates_per_step: int = 1 # replaces former update_epochs
     
     # policy params
     policy_hidden_layer_sizes: Sequence[int] = (32,) * 4 
@@ -106,6 +119,7 @@ class Config:
 
 InferenceParams = Tuple[running_statistics.NestedMeanStd, Any] # Not used
 Metrics = Mapping[str, jnp.ndarray]
+ReplayBufferState = Any
 
 _PMAP_AXIS_NAME = 'i'
 
@@ -164,7 +178,6 @@ class TrainingState:
 def make_inference_fn(ppo_networks: Union[PPONetworks, AtariPPONetworks]):
     """Creates params and inference function for the PPO agent."""
 
-    # TODO also infer values or do seperate function and wrap both in one
     def make_policy(params: Any,
                     deterministic: bool = False,
                     use_feature_extractor: bool = False,
@@ -198,6 +211,33 @@ def make_inference_fn(ppo_networks: Union[PPONetworks, AtariPPONetworks]):
     return make_policy
 
 
+def make_forward_fn(ppo_networks: Union[PPONetworks, AtariPPONetworks]):
+    """Creates params and inference function for the PPO agent."""
+
+    def make_forward(params: Any,
+                    use_feature_extractor: bool = False,
+                    ) -> ForwardPass:
+        policy_network = ppo_networks.policy_network
+        value_network = ppo_networks.value_network
+        if use_feature_extractor:
+            shared_feature_extractor = ppo_networks.feature_extractor
+        normalizer_params, policy_params, value_params, feature_extractor_params = params
+
+        @jax.jit # TODO jit needed ?
+        def forward_networks(observations: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+            if use_feature_extractor:
+                observations = shared_feature_extractor.apply(normalizer_params, feature_extractor_params, observations)
+            
+            logits = policy_network.apply(normalizer_params, policy_params, observations)
+            value = value_network.apply(normalizer_params, value_params, observations)
+
+            return logits, value
+
+        return forward_networks
+
+    return make_forward
+
+
 # def make_feature_extraction_fn(ppo_networks: AtariPPONetworks):
 #     """Creates feature extractor for inference."""
 
@@ -214,7 +254,7 @@ def make_inference_fn(ppo_networks: Union[PPONetworks, AtariPPONetworks]):
 
 
 def make_ppo_networks(
-        observation_size: int,
+        observation_size: Union[Sequence[int], int],
         action_size: int,
         preprocess_observation_fn: Callable, 
         policy_hidden_layer_sizes: Sequence[int] = (32,) * 4,
@@ -244,11 +284,11 @@ def make_ppo_networks(
         )
         policy_network = make_policy_network(
             parametric_action_distribution.param_size,
-            feature_extractor_dense_hidden_layer_sizes[-1],
+            feature_extractor_dense_hidden_layer_sizes[-1:],
             hidden_layer_sizes=(),
             activation=activation)
         value_network = make_value_network(
-            feature_extractor_dense_hidden_layer_sizes[-1],
+            feature_extractor_dense_hidden_layer_sizes[-1:],
             hidden_layer_sizes=(),
             activation=activation)
         return AtariPPONetworks(
@@ -277,48 +317,38 @@ def make_ppo_networks(
 def actor_step(
     env: GymnaxToBraxWrapper,
     env_state: State,
-    policy: Policy,
+    forward: ForwardPass,
     key: jnp.ndarray,
-    extra_fields: Sequence[str] = ()
-) -> Tuple[State, Transition]:
+    extra_fields: Sequence[str] = (),
+) -> Tuple[State, MCTSTransition]:
     """Collect data."""
 
-    key, logits_rng, q_rng, search_rng = jax.random.split(key, 4)
-    
+    key, logits_rng, search_rng = jax.random.split(key, 3)
+
+    # logits at root produced by the prior policy 
+    prior_logits, value = forward(env_state.obs)
    
-   # logits at root produced by the prior policy 
-    _, prior_policy_extras = policy(env_state.obs, logits_rng)
-    prior_logits = prior_policy_extras.log_prob
-
-    # TODO MCTS: forward value network
-    # TODO MCTS: pass in env / dynamics function for MuZero
-
-    # Defining a bandit with random Q-values. Only the Q-values of the visited
-    # actions will be revealed to the search algorithm.
-    qvalues = jax.random.uniform(q_rng, shape=prior_logits.shape)
-    # If we know the value under the prior policy, we can use the value to
-    # complete the missing Q-values. The completed Q-values will produce an
-    # improved policy in `policy_output.action_weights`.
-    raw_value = jnp.sum(jax.nn.softmax(prior_logits) * qvalues, axis=-1)
     use_mixed_value = False
 
     # NOTE: For AlphaZero embedding is env_state, for MuZero
     # the root output would be the output of MuZero representation network.
     root = mctx.RootFnOutput(
         prior_logits=prior_logits,
-        value=raw_value,
+        value=value,
         # The embedding is used only to implement the MuZero model.
         embedding=env_state, 
     )
-    # The recurrent_fn would be provided by MuZero dynamics network.
+
+    # The recurrent_fn is provided by MuZero dynamics network.
     # Or true environment for AlphaZero
-    # TODO: recurrent function includes: environment, policy and value network
+    # TODO MCTS: pass in dynamics function for MuZero
     def recurrent_fn(params, rng_key, action, embedding):
+        # environment (model)
         env_state = embedding
         nstate = env.step(env_state, action)
-        _, prior_policy_extras = policy(env_state.obs, key)
-        prior_logits = prior_policy_extras.log_prob
-        value = value_apply(normalizer_params, params.value, hidden)
+
+        # policy & value networks
+        prior_logits, value = forward(env_state.obs)
 
         # Create the new MCTS node.
         recurrent_fn_output = mctx.RecurrentFnOutput(
@@ -347,33 +377,28 @@ def actor_step(
             use_mixed_value=use_mixed_value),
     )
 
-    # Collecting the Q-value of the selected action.
-    selected_action_value = qvalues[jnp.arange(batch_size), policy_output.action]
-
-    # We will compare the selected action to the action selected by the
-    # prior policy, while using the same Gumbel random numbers.
-    gumbel = policy_output.search_tree.extra_data.root_gumbel
-    prior_policy_action = jnp.argmax(gumbel + prior_logits, axis=-1)
-    prior_policy_action_value = qvalues[jnp.arange(batch_size),
-                                        prior_policy_action]
-
-    # Computing the policy value under the new action_weights.
-    action_weights_policy_value = jnp.sum(
-        policy_output.action_weights * qvalues, axis=-1)
-
+    actions = policy_output.action
     ##################################### end mctx ######################################
+    
+    search_value = policy_output.search_tree.summary().value
 
-    actions, policy_extras = policy(env_state.obs, key)
+    policy_extras = {
+        'prior_log_prob': tfd.Categorical(logits=prior_logits).log_prob(actions),
+        'raw_action': actions
+    }
+
     nstate = env.step(env_state, actions)
     state_extras = {x: nstate.info[x] for x in extra_fields}
-    return nstate, Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
+    return nstate, MCTSTransition(  # pytype: disable=wrong-arg-types  # jax-ndarray
         observation=env_state.obs,
         action=actions,
         reward=nstate.reward,
         discount=1 - nstate.done,
         next_observation=nstate.obs,
+        target_policy_probs=policy_output.action_weights,
+        target_value=search_value,
         extras={
-            'policy_extras': policy_extras,
+            'policy_extras': policy_extras, 
             'state_extras': state_extras
         })
 
@@ -381,11 +406,11 @@ def actor_step(
 def generate_unroll(
     env: GymnaxToBraxWrapper,
     env_state: State,
-    policy: Policy,
+    forward: ForwardPass,
     key: jnp.ndarray,
     unroll_length: int,
     extra_fields: Sequence[str] = ()
-) -> Tuple[State, Transition]:
+) -> Tuple[State, MCTSTransition]:
     """Collect trajectories of given unroll_length."""
 
     @jax.jit
@@ -393,7 +418,7 @@ def generate_unroll(
         state, current_key = carry
         current_key, next_key = jax.random.split(current_key)
         nstate, transition = actor_step(
-            env, state, policy, current_key, extra_fields=extra_fields)
+            env, state, forward, current_key, extra_fields=extra_fields)
         return (nstate, next_key), transition
 
     (final_state, _), data = jax.lax.scan(
@@ -405,7 +430,7 @@ class Evaluator:
     """Class to run evaluations."""
 
     def __init__(self, eval_env: GymnaxToBraxWrapper,
-                eval_policy_fn: Callable[[Any],
+                eval_forward_fn: Callable[[Any],
                                             Policy], num_eval_envs: int,
                 episode_length: int, action_repeat: int, key: jnp.ndarray):
         """Init.
@@ -430,7 +455,7 @@ class Evaluator:
             return generate_unroll(
                 eval_env,
                 eval_first_state,
-                eval_policy_fn(policy_params),
+                eval_forward_fn(policy_params),
                 key,
                 unroll_length=episode_length // action_repeat)[0]
 
@@ -473,88 +498,17 @@ class Evaluator:
         return metrics  # pytype: disable=bad-return-type  # jax-ndarray
 
 
-
-def compute_gae(truncation: jnp.ndarray,
-                termination: jnp.ndarray,
-                rewards: jnp.ndarray,
-                values: jnp.ndarray,
-                bootstrap_value: jnp.ndarray,
-                lambda_: float = 1.0,
-                discount: float = 0.99):
-    """Calculates the Generalized Advantage Estimation (GAE).
-
-    Args:
-        truncation: A float32 tensor of shape [T, B] with truncation signal.
-        termination: A float32 tensor of shape [T, B] with termination signal.
-        rewards: A float32 tensor of shape [T, B] containing rewards generated by
-        following the behaviour policy.
-        values: A float32 tensor of shape [T, B] with the value function estimates
-        wrt. the target policy.
-        bootstrap_value: A float32 of shape [B] with the value function estimate at
-        time T.
-        lambda_: Mix between 1-step (lambda_=0) and n-step (lambda_=1). Defaults to
-        lambda_=1.
-        discount: TD discount.
-
-    Returns:
-        A float32 tensor of shape [T, B]. Can be used as target to
-        train a baseline (V(x_t) - vs_t)^2.
-        A float32 tensor of shape [T, B] of advantages.
-    """
-
-    truncation_mask = 1 - truncation
-    # Append bootstrapped value to get [v1, ..., v_t+1]
-    values_t_plus_1 = jnp.concatenate(
-        [values[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0)
-    deltas = rewards + discount * (1 - termination) * values_t_plus_1 - values
-    deltas *= truncation_mask
-
-    acc = jnp.zeros_like(bootstrap_value)
-    vs_minus_v_xs = []
-
-    def compute_vs_minus_v_xs(carry, target_t):
-        lambda_, acc = carry
-        truncation_mask, delta, termination = target_t
-        acc = delta + discount * (1 - termination) * truncation_mask * lambda_ * acc
-        return (lambda_, acc), (acc)
-
-    (_, _), (vs_minus_v_xs) = jax.lax.scan(
-        compute_vs_minus_v_xs, (lambda_, acc),
-        (truncation_mask, deltas, termination),
-        length=int(truncation_mask.shape[0]),
-        reverse=True)
-    # Add V(x_s) to get v_s.
-    vs = jnp.add(vs_minus_v_xs, values)
-
-    vs_t_plus_1 = jnp.concatenate(
-        [vs[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0)
-    advantages = (rewards + discount *
-                    (1 - termination) * vs_t_plus_1 - values) * truncation_mask
-    return jax.lax.stop_gradient(vs), jax.lax.stop_gradient(advantages)
-
-
-
-def compute_ppo_loss(
+def compute_muzero_loss(
     params: Union[PPONetworkParams, AtariPPONetworkParams],
     normalizer_params: Any,
-    data: Transition,
+    data: MCTSTransition,
     rng: jnp.ndarray,
     ppo_network: Union[PPONetworks, AtariPPONetworks],
     vf_cost: float = 0.5,
-    entropy_cost: float = 1e-4,
-    discounting: float = 0.9,
-    reward_scaling: float = 1.0,
-    gae_lambda: float = 0.95,
-    clipping_epsilon: float = 0.3,
-    normalize_advantage: bool = True,
+    l2_coef: float = 1e-4,
     shared_feature_extractor: bool = False,
 ) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
-    """Computes PPO loss including value loss and entropy bonus.
-
-    Policy loss: $L_\pi = \frac{1}{\lvert \mathcal{D} \rvert} \sum_{\mathcal{D}} 
-    \min \biggl( \frac{\pi_\theta (a \mid s)}{\pi_\text{old} 
-    (a \mid s)} \hat{A}, \text{clip}\Bigl( \frac{\pi_\theta (a \mid s)}{\pi_\text{old} 
-    (a \mid s)}, 1-\varepsilon, 1+\varepsilon \Bigr) \hat{A} \biggr)$
+    """Computes Alphazero loss .
 
     Args:
         params: Network parameters.
@@ -564,12 +518,8 @@ def compute_ppo_loss(
             ['policy_extras']['log_prob']
         rng: Random key
         ppo_network: PPO networks.
-        entropy_cost: entropy cost.
-        discounting: discounting,
-        reward_scaling: reward multiplier.
-        gae_lambda: General advantage estimation lambda.
-        clipping_epsilon: Policy loss clipping epsilon
-        normalize_advantage: whether to normalize advantage estimate
+        vf_cost: Value loss coefficient.
+        l2_coef: L2 penalty coefficient.
         shared_feature_extractor: Whether networks use a shared feature extractor.
 
     Returns:
@@ -581,73 +531,55 @@ def compute_ppo_loss(
     value_apply = ppo_network.value_network.apply
 
     # Put the time dimension first.
-    data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
+    # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
 
     hidden = data.observation
-    hidden_boot = data.next_observation[-1]
     if shared_feature_extractor:
         feature_extractor_apply = ppo_network.feature_extractor.apply
         hidden = feature_extractor_apply(normalizer_params, params.feature_extractor, data.observation)
-        hidden_boot = feature_extractor_apply(normalizer_params, params.feature_extractor, 
-                                          data.next_observation[-1])
     
     policy_logits = policy_apply(normalizer_params, params.policy,
                                 hidden)
 
     baseline = value_apply(normalizer_params, params.value, hidden)
 
-    
-    bootstrap_value = value_apply(normalizer_params, params.value,
-                                    hidden_boot)
+    policy_targets = data.target_policy_probs
 
-    rewards = data.reward * reward_scaling
-    truncation = data.extras['state_extras']['truncation']
-    termination = (1 - data.discount) * (1 - truncation)  # NOTE: truncation flag only set if not terminated --> termination > truncation
+    # target_action_log_probs = parametric_action_distribution.log_prob(
+    #     policy_logits, data.extras['policy_extras']['raw_action'])
+    # behaviour_action_log_probs = data.extras['policy_extras']['prior_log_prob']
 
-    target_action_log_probs = parametric_action_distribution.log_prob(
-        policy_logits, data.extras['policy_extras']['raw_action'])
-    behaviour_action_log_probs = data.extras['policy_extras']['log_prob']
+    # log_ratio = target_action_log_probs - behaviour_action_log_probs
+    # rho_s = jnp.exp(log_ratio)
+    # approx_kl = ((rho_s - 1) - log_ratio).mean()
 
-    vs, advantages = compute_gae(
-        truncation=truncation,
-        termination=termination,
-        rewards=rewards,
-        values=baseline,
-        bootstrap_value=bootstrap_value,
-        lambda_=gae_lambda,
-        discount=discounting)
-    if normalize_advantage:
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-    log_ratio = target_action_log_probs - behaviour_action_log_probs
-    rho_s = jnp.exp(log_ratio)
-
-    surrogate_loss1 = rho_s * advantages
-    surrogate_loss2 = jnp.clip(rho_s, 1 - clipping_epsilon,
-                                1 + clipping_epsilon) * advantages
-
-    policy_loss = -jnp.mean(jnp.minimum(surrogate_loss1, surrogate_loss2))
-    approx_kl = ((rho_s - 1) - log_ratio).mean()
+    policy_loss = -jnp.mean(jnp.sum(jax.lax.stop_gradient(policy_targets)*(jax.nn.log_softmax(policy_logits)), axis=-1))
 
     # Value function loss
-    v_error = vs - baseline
+    vs = data.target_value
+    v_error = jax.lax.stop_gradient(vs) - baseline
     v_loss = jnp.mean(v_error * v_error) * 0.5 * vf_cost
+
+    # l2 penalty
+    l2_penalty = l2_coef * 0.5 * sum(
+        jnp.sum(jnp.square(w)) for w in jax.tree_util.tree_leaves(params))
 
     # Entropy reward
     entropy = jnp.mean(parametric_action_distribution.entropy(policy_logits, rng))
-    entropy_loss = entropy_cost * -entropy
 
-    total_loss = policy_loss + v_loss + entropy_loss
+    total_loss = policy_loss + v_loss + l2_penalty
 
     metrics = {
         'total_loss': total_loss,
         'policy_loss': policy_loss,
         'value_loss': v_loss,
-        'entropy_loss': entropy_loss,
+        'l2_penalty': l2_penalty,
         'entropy': entropy, 
-        'approx_kl': jax.lax.stop_gradient(approx_kl), 
+        # 'approx_kl': jax.lax.stop_gradient(approx_kl), 
     }
 
     return total_loss, metrics
+
 
 
 
@@ -675,16 +607,30 @@ def main(_):
     device_count = local_devices_to_use * process_count
     assert Config.num_envs % device_count == 0
 
+    if Config.min_replay_size >= Config.total_timesteps:
+        raise ValueError(
+            'No training will happen because min_replay_size >= total_timesteps')
 
-    assert Config.batch_size * Config.num_minibatches % Config.num_envs == 0
+    if Config.max_replay_size is None:
+        max_replay_size = Config.total_timesteps
+    else:
+        max_replay_size = Config.max_replay_size
+
+    
+    env_steps_per_actor_step = Config.action_repeat * Config.num_envs
+    num_prefill_actor_steps = np.ceil(Config.min_replay_size / (env_steps_per_actor_step))
+    num_prefill_env_steps = num_prefill_actor_steps * env_steps_per_actor_step
+    assert Config.total_timesteps - num_prefill_env_steps >= 0
+
+    assert Config.replay_buffer_batch_size % Config.num_minibatches == 0
     # The number of environment steps executed for every training step.
-    env_step_per_training_step = (
-        Config.batch_size * Config.unroll_length * Config.num_minibatches * Config.action_repeat) 
+    env_step_per_training_step = Config.unroll_length * Config.num_envs
     num_training_steps = np.ceil(Config.total_timesteps / env_step_per_training_step).astype(int)
     num_evals_after_init = max(np.floor(num_training_steps / Config.eval_every).astype(int), 1)
     num_training_steps_per_epoch = np.ceil(
-        Config.total_timesteps / (num_evals_after_init * env_step_per_training_step * max(Config.num_resets_per_eval, 1))
-  ).astype(int)
+        (Config.total_timesteps - num_prefill_env_steps) / 
+        (num_evals_after_init * env_step_per_training_step * max(Config.num_resets_per_eval, 1))
+    ).astype(int)
 
     # log hyperparameters
     logging.info("|param: value|")
@@ -699,7 +645,7 @@ def main(_):
     global_key, local_key = jax.random.split(key)
     del key
     local_key = jax.random.fold_in(local_key, process_id)
-    local_key, key_envs, eval_key = jax.random.split(local_key, 3)
+    local_key, rb_key, key_envs, eval_key = jax.random.split(local_key, 4)
     # key_networks should be global, so that networks are initialized the same
     # way for different processes.
     key_policy, key_value, key_feature_extractor = jax.random.split(global_key, 3)
@@ -730,7 +676,33 @@ def main(_):
     if is_atari:
         observation_shape = env_state.obs.shape[-3:]
     else:
-        observation_shape = env_state.obs.shape[-1]
+        observation_shape = env_state.obs.shape[-1:]
+
+    # intialize replay buffer
+    dummy_obs = jnp.zeros(observation_shape,)
+    dummy_action = jnp.zeros((action_size,))
+    dummy_transition = MCTSTransition(  # pytype: disable=wrong-arg-types  # jax-ndarray
+        observation=dummy_obs,
+        action=dummy_action,
+        reward=0.,
+        discount=0.,
+        next_observation=dummy_obs,
+        target_policy_probs=jnp.zeros((action_size,)),
+        target_value=0.,
+        extras={
+            'state_extras': {
+                'truncation': 0.
+            },
+            'policy_extras': {
+                'prior_log_prob': dummy_action,
+                'raw_action': dummy_action
+            }
+        })
+    replay_buffer = replay_buffers.UniformSamplingQueue(
+        max_replay_size=max_replay_size // device_count,
+        dummy_data_sample=dummy_transition,
+        sample_batch_size=Config.replay_buffer_batch_size * Config.grad_updates_per_step // device_count)
+    
 
     # Normalize moved from env to network
     normalize = lambda x, y: x
@@ -749,11 +721,8 @@ def main(_):
         shared_feature_extractor=is_atari,
         feature_extractor_dense_hidden_layer_sizes=Config.atari_dense_layer_sizes,
     )
-    make_policy = make_inference_fn(ppo_network)
-    make_policy = partial(make_policy, use_feature_extractor=is_atari)
-    # Deprecated
-    # if is_atari:
-    #     make_feature_extractor = make_feature_extraction_fn(ppo_network)
+    make_forward = make_forward_fn(ppo_network)
+    make_forward = partial(make_forward, use_feature_extractor=is_atari)
 
     # create optimizer
     if Config.anneal_lr:    
@@ -771,15 +740,10 @@ def main(_):
 
     # create loss function via functools.partial
     loss_fn = partial(
-        compute_ppo_loss,
+        compute_muzero_loss,
         ppo_network=ppo_network,
         vf_cost=Config.vf_cost,
-        entropy_cost=Config.entropy_cost,
-        discounting=Config.gamma,
-        reward_scaling=Config.reward_scaling,
-        gae_lambda=Config.gae_lambda,
-        clipping_epsilon=Config.clip_eps,
-        normalize_advantage=Config.normalize_advantages,
+        l2_coef=Config.l2_coef,
         shared_feature_extractor=is_atari,
     )
 
@@ -830,7 +794,7 @@ def main(_):
         )
 
     # minibatch training step
-    def minibatch_step(carry, data: Transition, normalizer_params: running_statistics.RunningStatisticsState):
+    def minibatch_step(carry, data: MCTSTransition, normalizer_params: running_statistics.RunningStatisticsState):
         optimizer_state, params, key = carry
         key, key_loss = jax.random.split(key)
         (_, metrics), params, optimizer_state = gradient_update_fn(
@@ -844,7 +808,7 @@ def main(_):
 
 
     # sgd step
-    def sgd_step(carry, unused_t, data: Transition, normalizer_params: running_statistics.RunningStatisticsState):
+    def sgd_step(carry, data: MCTSTransition, normalizer_params: running_statistics.RunningStatisticsState):
         optimizer_state, params, key = carry
         key, key_perm, key_grad = jax.random.split(key, 3)
 
@@ -862,39 +826,39 @@ def main(_):
         return (optimizer_state, params, key), metrics
     
 
-    ######################################## BRAX #############################################
     def training_step(
         carry: Tuple[TrainingState, State, jnp.ndarray],
         unused_t
     ) -> Tuple[Tuple[TrainingState, State, jnp.ndarray], Metrics]:
-        training_state, state, key = carry
+        training_state, state, buffer_state, key = carry
         key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
 
-        policy = make_policy(
-            (training_state.normalizer_params, training_state.params.policy, training_state.params.feature_extractor))
+        forward_fn = make_forward(
+            (training_state.normalizer_params, training_state.params.policy, 
+             training_state.params.value, training_state.params.feature_extractor)
+        )
 
-        def f(carry, unused_t):
-            current_state, current_key = carry
-            current_key, next_key = jax.random.split(current_key)
-            next_state, data = generate_unroll(
-                env,
-                current_state,
-                policy,
-                current_key,
-                Config.unroll_length,
-                extra_fields=('truncation',))
-            return (next_state, next_key), data
-
-        # TODO: data now will be replay buffer, that will be passed in and out
-        # TODO: just add the rollout data to buffer here (?)
-        (state, _), data = jax.lax.scan(
-            f, (state, key_generate_unroll), (),
-            length=Config.batch_size * Config.num_minibatches // Config.num_envs) 
+        state, data = generate_unroll(
+            env,
+            state,
+            forward_fn,
+            key_generate_unroll,
+            Config.unroll_length,
+            extra_fields=('truncation',))
+        
         # Have leading dimensions (batch_size * num_minibatches, unroll_length)
-        data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
+        # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
         data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
                                     data)
-        assert data.discount.shape[1:] == (Config.unroll_length,)
+        # assert data.discount.shape[1:] == (Config.unroll_length,)
+        assert data.discount.shape[0] == Config.unroll_length * Config.num_envs
+        chex.assert_shape(data.observation, [Config.unroll_length * Config.num_envs] + list(observation_shape))
+
+        # TODO BUFFER probably reshaping / flattening data needed
+        # NOTE we might want to keep the current structure nonetheless to keep episodes intact 
+        # following muzeros further training stuff (re-analyze etc.)
+
+        buffer_state = replay_buffer.insert(buffer_state, data)
 
         # Update normalization params and normalize observations.
         normalizer_params = running_statistics.update(
@@ -902,38 +866,47 @@ def main(_):
             data.observation,
             pmap_axis_name=_PMAP_AXIS_NAME)
         
-        # TODO adapt to muzero learning phase
+        # sampling from replay buffer
+        buffer_state, data = replay_buffer.sample(buffer_state)
+        # Change the front dimension of transitions so 'update_step' is called
+        # grad_updates_per_step times by the scan.
+        data = jax.tree_util.tree_map(
+            lambda x: jnp.reshape(x, (Config.grad_updates_per_step, -1) + x.shape[1:]),
+            data)
+        
         (optimizer_state, params, _), metrics = jax.lax.scan(
-            partial(sgd_step, data=data, normalizer_params=normalizer_params),
-            (training_state.optimizer_state, training_state.params, key_sgd), (),
-            length=Config.update_epochs)
+            partial(sgd_step, normalizer_params=normalizer_params),
+            (training_state.optimizer_state, training_state.params, key_sgd), data
+            )
 
         new_training_state = TrainingState(
             optimizer_state=optimizer_state,
             params=params,
             normalizer_params=normalizer_params,
             env_steps=training_state.env_steps + env_step_per_training_step) 
-        return (new_training_state, state, new_key), metrics
+        
+        metrics['buffer_current_size'] = replay_buffer.size(buffer_state)
+        return (new_training_state, state, buffer_state, new_key), metrics
 
-    def training_epoch(training_state: TrainingState, state: State,
+    def training_epoch(training_state: TrainingState, state: State, buffer_state: ReplayBufferState,
                         key: jnp.ndarray) -> Tuple[TrainingState, State, Metrics]:
-        (training_state, state, _), loss_metrics = jax.lax.scan(
-            training_step, (training_state, state, key), (),
+        (training_state, state, buffer_state, _), loss_metrics = jax.lax.scan(
+            training_step, (training_state, state, buffer_state, key), (),
             length=num_training_steps_per_epoch)
         loss_metrics = jax.tree_util.tree_map(jnp.mean, loss_metrics)
-        return training_state, state, loss_metrics
+        return training_state, state, buffer_state, loss_metrics
 
     training_epoch = jax.pmap(training_epoch, axis_name=_PMAP_AXIS_NAME)
 
     # Note that this is NOT a pure jittable method.
     def training_epoch_with_timing(
-        training_state: TrainingState, env_state: State,
+        training_state: TrainingState, env_state: State, buffer_state: ReplayBufferState,
         key: jnp.ndarray) -> Tuple[TrainingState, State, Metrics]:
         nonlocal training_walltime
         t = time.time()
-        training_state, env_state = _strip_weak_type((training_state, env_state))
-        result = training_epoch(training_state, env_state, key)
-        training_state, env_state, metrics = _strip_weak_type(result)
+        training_state, env_state = _strip_weak_type((training_state, env_state)) # TODO also needed for replay buffer?
+        (training_state, env_state, buffer_state, metrics) = training_epoch(training_state, env_state, buffer_state, key)
+        training_state, env_state, metrics = _strip_weak_type((training_state, env_state, metrics))
 
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
@@ -951,7 +924,109 @@ def main(_):
             'training/epoch_training_time': np.round(epoch_training_time),
             **{f'training/{name}': float(value) for name, value in metrics.items()} 
         }
-        return training_state, env_state, metrics  # pytype: disable=bad-return-type  # py311-upgrade
+        return training_state, env_state, buffer_state, metrics  # pytype: disable=bad-return-type  # py311-upgrade
+    
+
+    def prefill_replay_buffer(
+        training_state: TrainingState, env_state: State,
+        buffer_state: ReplayBufferState, key: jnp.ndarray
+    ) -> Tuple[TrainingState, State, ReplayBufferState, jnp.ndarray]:
+
+        # def f(carry, unused):
+        #     del unused
+        #     training_state, env_state, buffer_state, key = carry
+        #     key_generate_unroll, new_key = jax.random.split(key)
+        #     ################################ get experience ##############################
+        #     forward_fn = make_forward(
+        #         (training_state.normalizer_params, training_state.params.policy, 
+        #         training_state.params.value, training_state.params.feature_extractor)
+        #     )
+
+        #     def f(carry, unused_t):
+        #         current_state, current_key = carry
+        #         current_key, next_key = jax.random.split(current_key)
+        #         next_state, data = generate_unroll(
+        #             env,
+        #             current_state,
+        #             forward_fn,
+        #             current_key,
+        #             Config.unroll_length,
+        #             extra_fields=('truncation',))
+        #         return (next_state, next_key), data
+
+        #     (state, _), data = jax.lax.scan(
+        #         f, (state, key_generate_unroll), (),
+        #         length=Config.batch_size * Config.num_minibatches // Config.num_envs) 
+        #     # Have leading dimensions (batch_size * num_minibatches, unroll_length)
+        #     data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
+        #     data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
+        #                                 data)
+        #     assert data.discount.shape[1:] == (Config.unroll_length,)
+
+        #     # TODO BUFFER probably reshaping / flattening data needed
+        #     # NOTE we might want to keep the current structure nonetheless to keep episodes intact 
+        #     # following muzeros further training stuff (re-analyze etc.)
+
+        #     buffer_state = replay_buffer.insert(buffer_state, data)
+        #     ##############################################################################
+        #     normalizer_params = running_statistics.update(
+        #         training_state.normalizer_params,
+        #         data.observation,
+        #         pmap_axis_name=_PMAP_AXIS_NAME)
+
+        #     new_training_state = training_state.replace(
+        #         normalizer_params=normalizer_params,
+        #         env_steps=training_state.env_steps + env_steps_per_actor_step)
+        #     return (new_training_state, env_state, buffer_state, new_key), ()
+
+        # return jax.lax.scan(
+        #     f, (training_state, env_state, buffer_state, key), (),
+        #     length=num_prefill_actor_steps)[0]
+
+        key_generate_unroll, new_key = jax.random.split(key)
+
+        forward_fn = make_forward(
+            (training_state.normalizer_params, training_state.params.policy, 
+            training_state.params.value, training_state.params.feature_extractor)
+        )
+
+        env_state, data = generate_unroll(
+            env,
+            env_state,
+            forward_fn,
+            key_generate_unroll,
+            num_prefill_actor_steps,
+            extra_fields=('truncation',)
+        )
+
+        # Have leading dimensions (batch_size * num_minibatches, unroll_length)
+        # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
+        data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
+                                    data)
+        # assert data.discount.shape[1:] == (Config.unroll_length,)
+        assert data.discount.shape[0] == num_prefill_actor_steps * Config.num_envs
+        chex.assert_shape(data.discount, [num_prefill_actor_steps * Config.num_envs, ])
+        chex.assert_shape(data.observation, [num_prefill_actor_steps * Config.num_envs] + list(observation_shape))
+
+        # TODO BUFFER probably reshaping / flattening data needed
+        # NOTE we might want to keep the current structure nonetheless to keep episodes intact 
+        # following muzeros further training stuff (re-analyze etc.)
+
+        buffer_state = replay_buffer.insert(buffer_state, data)
+
+        normalizer_params = running_statistics.update(
+            training_state.normalizer_params,
+            data.observation,
+            pmap_axis_name=_PMAP_AXIS_NAME)
+
+        new_training_state = training_state.replace(
+            normalizer_params=normalizer_params,
+            env_steps=training_state.env_steps + env_steps_per_actor_step)
+        return new_training_state, env_state, buffer_state, new_key
+        
+
+    prefill_replay_buffer = jax.pmap(
+        prefill_replay_buffer, axis_name=_PMAP_AXIS_NAME)
 
 
     # initialize params & training state
@@ -978,6 +1053,10 @@ def main(_):
         training_state,
         jax.local_devices()[:local_devices_to_use])
     
+    # Replay buffer init
+    buffer_state = jax.pmap(replay_buffer.init)(
+        jax.random.split(rb_key, local_devices_to_use)
+    )
 
     # create eval env
     eval_env = wrap_for_training(
@@ -988,7 +1067,7 @@ def main(_):
 
     evaluator = Evaluator(
         eval_env,
-        partial(make_policy, deterministic=Config.deterministic_eval),
+        make_forward,
         num_eval_envs=Config.num_eval_envs,
         episode_length=Config.episode_length,
         action_repeat=Config.action_repeat,
@@ -1000,10 +1079,25 @@ def main(_):
     if process_id == 0 and eval_env:
         metrics = evaluator.run_evaluation(
             _unpmap(
-                (training_state.normalizer_params, training_state.params.policy, training_state.params.feature_extractor)),
+                (training_state.normalizer_params, training_state.params.policy, 
+                 training_state.params.value, training_state.params.feature_extractor)
+                ),
             training_metrics={})
         logging.info(metrics)
         # progress_fn(0, metrics)
+
+    # prefill replay buffer
+    start_prefill = time.time()
+    logging.info('prefilling replay buffer')
+    prefill_key, local_key = jax.random.split(local_key)
+    prefill_keys = jax.random.split(prefill_key, local_devices_to_use)
+    training_state, env_state, buffer_state, _ = prefill_replay_buffer(
+        training_state, env_state, buffer_state, prefill_keys)
+
+    replay_size = jnp.sum(jax.vmap(
+        replay_buffer.size)(buffer_state)) * jax.process_count()
+    logging.info('replay size after prefill %s, took %s', replay_size, time.time() - start_prefill)
+    assert replay_size >= Config.min_replay_size
 
     # initialize metrics
     training_walltime = 0
@@ -1016,8 +1110,8 @@ def main(_):
             # optimization
             epoch_key, local_key = jax.random.split(local_key)
             epoch_keys = jax.random.split(epoch_key, local_devices_to_use)
-            (training_state, env_state, training_metrics) = (
-                training_epoch_with_timing(training_state, env_state, epoch_keys)
+            (training_state, env_state, buffer_state, training_metrics) = (
+                training_epoch_with_timing(training_state, env_state, buffer_state, epoch_keys)
             )
             
             logging.info(training_metrics)
@@ -1035,7 +1129,8 @@ def main(_):
             # Run evals.
             metrics = evaluator.run_evaluation(
                 _unpmap(
-                    (training_state.normalizer_params, training_state.params.policy, training_state.params.feature_extractor)),
+                    (training_state.normalizer_params, training_state.params.policy,
+                     training_state.params.value, training_state.params.feature_extractor)),
                 training_metrics={})
             
             # record scores

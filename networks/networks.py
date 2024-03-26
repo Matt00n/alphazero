@@ -163,7 +163,7 @@ def make_policy_network(
         obs = preprocess_observation_fn(obs, processor_params)
         return policy_module.apply(policy_params, obs)
 
-    dummy_obs = jnp.zeros((1, obs_size))
+    dummy_obs = jnp.zeros((1,) + obs_size) # jnp.zeros((1, obs_size))
     return FeedForwardNetwork(
         init=lambda key: policy_module.init(key, dummy_obs), apply=apply)
 
@@ -183,6 +183,6 @@ def make_value_network(
         obs = preprocess_observation_fn(obs, processor_params)
         return jnp.squeeze(value_module.apply(policy_params, obs), axis=-1)
 
-    dummy_obs = jnp.zeros((1, obs_size))
+    dummy_obs = jnp.zeros((1,) + obs_size) # jnp.zeros((1, obs_size))
     return FeedForwardNetwork(
         init=lambda key: value_module.init(key, dummy_obs), apply=apply)
