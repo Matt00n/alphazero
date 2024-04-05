@@ -1,3 +1,6 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+training_logs/
+experiments/
+plots/

@@ -36,8 +36,8 @@ class Tree(Generic[T]):
   actions.
 
   node_visits: `[B, N]` the visit counts for each node.
-  raw_values: `[B, N]` the raw value for each node.
-  node_values: `[B, N]` the cumulative search value for each node.
+  raw_values: `[B, N, num_atoms]` the raw value for each node.
+  node_values: `[B, N, num_atoms]` the cumulative search value for each node.
   parents: `[B, N]` the node index for the parents for each node.
   action_from_parent: `[B, N]` action to take from the parent to reach each
     node.
@@ -50,7 +50,7 @@ class Tree(Generic[T]):
   children_rewards: `[B, N, num_actions]` the immediate reward for each action.
   children_discounts: `[B, N, num_actions]` the discount between the
     `children_rewards` and the `children_values`.
-  children_values: `[B, N, num_actions]` the value of the next node after the
+  children_values: `[B, N, num_actions, num_atoms]` the value of the next node after the
     action.
   embeddings: `[B, N, ...]` the state embeddings of each node.
   root_invalid_actions: `[B, num_actions]` a mask with invalid actions at the
@@ -58,8 +58,8 @@ class Tree(Generic[T]):
   extra_data: `[B, ...]` extra data passed to the search.
   """
   node_visits: chex.Array  # [B, N]
-  raw_values: chex.Array  # [B, N]
-  node_values: chex.Array  # [B, N]
+  raw_values: chex.Array  # [B, N, num_atoms]
+  node_values: chex.Array  # [B, N, num_atoms]
   parents: chex.Array  # [B, N]
   action_from_parent: chex.Array  # [B, N]
   children_index: chex.Array  # [B, N, num_actions]
@@ -67,7 +67,7 @@ class Tree(Generic[T]):
   children_visits: chex.Array  # [B, N, num_actions]
   children_rewards: chex.Array  # [B, N, num_actions]
   children_discounts: chex.Array  # [B, N, num_actions]
-  children_values: chex.Array  # [B, N, num_actions]
+  children_values: chex.Array  # [B, N, num_actions, num_atoms]
   embeddings: Any  # [B, N, ...]
   root_invalid_actions: chex.Array  # [B, num_actions]
   extra_data: T  # [B, ...]
@@ -81,6 +81,10 @@ class Tree(Generic[T]):
   @property
   def num_actions(self):
     return self.children_index.shape[-1]
+  
+  @property
+  def num_value_atoms(self):
+    return self.node_values.shape[-1]
 
   @property
   def num_simulations(self):
@@ -98,9 +102,9 @@ class Tree(Generic[T]):
   def summary(self) -> SearchSummary:
     """Extract summary statistics for the root node."""
     # Get state and action values for the root nodes.
-    chex.assert_rank(self.node_values, 2)
-    value = self.node_values[:, Tree.ROOT_INDEX]
-    batch_size, = value.shape
+    chex.assert_rank(self.node_values, 3)
+    value = self.node_values[:, Tree.ROOT_INDEX, :]
+    batch_size = value.shape[0]
     root_indices = jnp.full((batch_size,), Tree.ROOT_INDEX)
     qvalues = self.qvalues(root_indices)
     # Extract visit counts and induced probabilities for the root nodes.
@@ -118,7 +122,7 @@ class Tree(Generic[T]):
 
 def infer_batch_size(tree: Tree) -> int:
   """Recovers batch size from `Tree` data structure."""
-  if tree.node_values.ndim != 2:
+  if tree.node_values.ndim != 3:
     raise ValueError("Input tree is not batched.")
   chex.assert_equal_shape_prefix(jax.tree_util.tree_leaves(tree), 1)
   return tree.node_values.shape[0]
@@ -138,8 +142,8 @@ class SearchSummary:
 def _unbatched_qvalues(tree: Tree, index: int) -> int:
   chex.assert_rank(tree.children_discounts, 2)
   return (  # pytype: disable=bad-return-type  # numpy-scalars
-      tree.children_rewards[index]
-      + tree.children_discounts[index] * tree.children_values[index]
+      jnp.expand_dims(tree.children_rewards[index], -1)
+      + jnp.expand_dims(tree.children_discounts[index], -1) * tree.children_values[index]
   )
 
 
@@ -159,7 +163,7 @@ def draw_tree_to_file(
   Returns:
     A Graphviz graph representation of `tree`.
   """
-  chex.assert_rank(tree.node_values, 2)
+  chex.assert_rank(tree.node_values, 3)
   batch_size = tree.node_values.shape[0]
   if action_labels is None:
     action_labels = range(tree.num_actions)
@@ -173,14 +177,14 @@ def draw_tree_to_file(
     return (f"{node_i}\n"
             f"Reward: {reward:.2f}\n"
             f"Discount: {discount:.2f}\n"
-            f"Value: {tree.node_values[batch_index, node_i]:.2f}\n"
+            f"Value: {jnp.mean(tree.node_values[batch_index, node_i], axis=-1):.2f}\n" # TODO adapt to categorical
             f"Visits: {tree.node_visits[batch_index, node_i]}\n")
 
   def edge_to_str(node_i, a_i):
     node_index = jnp.full([batch_size], node_i)
     probs = jax.nn.softmax(tree.children_prior_logits[batch_index, node_i])
     return (f"{action_labels[a_i]}\n"
-            f"Q: {tree.qvalues(node_index)[batch_index, a_i]:.2f}\n"  # pytype: disable=unsupported-operands  # always-use-return-annotations
+            f"Q: {jnp.mean(tree.qvalues(node_index)[batch_index, a_i], axis=-1):.2f}\n"  # pytype: disable=unsupported-operands  # always-use-return-annotations
             f"p: {probs[a_i]:.2f}\n")
 
   graph = pygraphviz.AGraph(directed=True)

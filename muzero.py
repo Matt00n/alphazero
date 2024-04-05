@@ -14,22 +14,31 @@
 
 # Adapt implementation details from further papers: EfficientZero, Reanalyze, Sampled Muzero, Gumble Muzero, AlphaTensor, AlphaDev, DreamerV3
 
-# TODO MUZERO: Prioritized replay buffer (see https://github.com/werner-duvaud/muzero-general/tree/master 
+# DONE MUZERO: Prioritized replay buffer (see https://github.com/werner-duvaud/muzero-general/tree/master 
 # and https://github.com/YeWR/EfficientZero/blob/main/core/replay_buffer.py)
-# TODO MUZERO: Categorical value function
-# TODO MUZERO: value targets not computed correctly
-# NOTE: value targets: we use root search value as target. THIS IS ONLY POSSIBLE SINCE WE USE THE REAL ENV / REWARDS during search.
+# DONE MUZERO: Categorical value function (QR from AlphaTensor instead of MuZeros version)
+# DONE MUZERO: n-step value targets
 # TODO MUZERO: Learn Model
-# TODO NOTE: Muzero samples trajectories during training: unrolls model in parallel to true trajectory and then computes loss for every step.
+# NOTE: Muzero samples trajectories during training: unrolls model in parallel to true trajectory and then computes loss for every step.
 #           We do not do this since we do not train a model anyway --> apply policy / value to true observation instead of its representation.
+# TODO MUZERO REANALYZE: option for reanalyzing data in buffer
+# TODO MUZERO REANALYZE: target network (for value), which is updated infrequently
 # TODO MUZERO REANALYZE: reanalyze highest reward states (exploit rare events)
 # TODO SAMPLED MUZERO: Look into sampling of actions here vs gumbel muzero
+# TODO mixture of gumbel muzero and muzero? gumbel only for root action selection, other pucb?
+# TODO test evaluation with gumbel scale set to zero (requires passing in mctx policy as argument)
 # TODO SAMPLED MUZERO: support for continuous action spaces
-# TODO ALPHATENSOR: quantile regression distributional loss for value function
+# DONE ALPHATENSOR: quantile regression distributional loss for value function
+# TODO ALPHATENSOR: option for implicit quantile networks (IQN) distributional loss for value function
 # TODO ALPHATENSOR: sub-tree persistence --> subtree of selected action is reused in next search
 # TODO ALPHATENSOR: bootstrapping during search not with mean value but risk-seeking value (average of quantiles above 75%)
 # (since deterministic env and only interested in best action) (ALSO SEE https://github.com/bwfbowen/muax/tree/main/muax
 # and https://github.com/werner-duvaud/muzero-general/blob/master/models.py for example)
+
+# CURRENT FOCUS
+# target network for value
+# REANALYZE
+# Sampled Muzero
 
 # TODO: look into running jax on (M1) GPU: Gymnax, Jax docs, Jax metal
 # TODO: clean up and organize code / folders
@@ -40,7 +49,7 @@
 # TODO potentially change generate unroll to generate episodes (remove auto reset and reset manually after unroll)
 
 # Optional / future research
-# TODO incorporate GAE into tree search to construct targets
+# TODO incorporate GAE into tree search to construct targets: difficulty: reanalyze --> needs restructuring of buffer to store episodes
 # TODO MCTS replay vs rollout buffer
 
 
@@ -76,12 +85,12 @@ import replay_buffers
 import running_statistics
 from gymnax import gymnax
 from gymnax.gymnax.wrappers.brax import GymnaxToBraxWrapper, State
-import mctx
+import mctx_dist as mctx
 
 class Config:
     # experiment
     experiment_name = 'ppo_test'
-    seed = 42
+    seed = 20
     platform = 'cpu' # CPU or GPU
     capture_video = False
     write_logs_to_file = False
@@ -105,11 +114,23 @@ class Config:
     max_num_considered_actions = 16
     l2_coef = 1e-4
     vf_cost = 0.5
+    n_step_gamma = 1.
+    n_step_n = 5
+
+    # quantile regression
+    num_atoms: int = 1 # 8 # NOTE: num_atoms = 1 yields non-distributional RL with MSE loss
+    qr_kappa: float = 1.
+
+    # reanalyze
+    reanalyze: bool = False
 
     # replay buffer
     min_replay_size: int = 8192
-    max_replay_size: Optional[int] = 8192 # 16384
+    max_replay_size: Optional[int] = 8192 # 8192 # 16384
     replay_buffer_batch_size: int = 128 # 256
+    per_alpha: float = 0.
+    per_importance_sampling: bool = True
+    per_importance_sampling_beta: float = 1.
 
     # algorithm hyperparameters
     total_timesteps = int(1e6) 
@@ -117,7 +138,7 @@ class Config:
     unroll_length = 512 # 128 
     anneal_lr = True
     num_minibatches = 64 # 64
-    update_epochs = 1 # 10
+    update_epochs = 1 # NOTE: no reason to increase this, just increase sample size instead
     max_grad_norm = 0.5
     
     # policy params
@@ -253,6 +274,7 @@ def make_forward_fn(ppo_networks: Union[PPONetworks, AtariPPONetworks]):
 def make_ppo_networks(
         observation_size: Union[Sequence[int], int],
         action_size: int,
+        num_atoms: int,
         preprocess_observation_fn: Callable, 
         policy_hidden_layer_sizes: Sequence[int] = (32,) * 4,
         value_hidden_layer_sizes: Sequence[int] = (256,) * 5,
@@ -286,6 +308,7 @@ def make_ppo_networks(
             activation=activation)
         value_network = make_value_network(
             feature_extractor_dense_hidden_layer_sizes[-1:],
+            num_atoms=num_atoms,
             hidden_layer_sizes=(),
             activation=activation)
         return AtariPPONetworks(
@@ -301,6 +324,7 @@ def make_ppo_networks(
         activation=activation)
     value_network = make_value_network(
         observation_size,
+        num_atoms=num_atoms,
         preprocess_observation_fn=preprocess_observation_fn,
         hidden_layer_sizes=value_hidden_layer_sizes,
         activation=activation)
@@ -363,21 +387,35 @@ def actor_step(
         return recurrent_fn_output, nstate
 
     # Running the search.
-    policy_output = mctx.gumbel_muzero_policy(
+    # policy_output = mctx.gumbel_muzero_policy(
+    #     params=(),
+    #     rng_key=search_rng,
+    #     root=root,
+    #     recurrent_fn=recurrent_fn,
+    #     num_simulations=Config.num_simulations,
+    #     max_num_considered_actions=Config.max_num_considered_actions,
+    #     qtransform=partial(
+    #         mctx.qtransform_completed_by_mix_value,
+    #         use_mixed_value=use_mixed_value),
+    # )
+
+    policy_output = mctx.muzero_policy(
         params=(),
         rng_key=search_rng,
         root=root,
         recurrent_fn=recurrent_fn,
         num_simulations=Config.num_simulations,
-        max_num_considered_actions=Config.max_num_considered_actions,
-        qtransform=partial(
-            mctx.qtransform_completed_by_mix_value,
-            use_mixed_value=use_mixed_value),
+        dirichlet_fraction=0.25,
+        dirichlet_alpha=0.3,
+        pb_c_init=1.25,
+        pb_c_base=19652,
+        temperature=1.0,
     )
 
     actions = policy_output.action
     action_weights = policy_output.action_weights
-    best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
+    # best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
+    best_actions = jnp.argmax(jnp.mean(policy_output.search_tree.summary().qvalues, axis=-1), axis=-1).astype(jnp.int32)
     actions = jax.lax.select(deterministic_actions, best_actions, actions)
     
     search_value = policy_output.search_tree.summary().value
@@ -396,11 +434,17 @@ def actor_step(
         discount=1 - nstate.done,
         next_observation=nstate.obs,
         target_policy_probs=action_weights,
-        target_value=search_value,
+        search_value=search_value,
+        value_prefix_target=jnp.zeros_like(nstate.reward),
+        bootstrap_observation=jnp.zeros_like(env_state.obs),
+        bootstrap_value=value, # NOTE: we overload here to save space
+        bootstrap_discount=jnp.ones_like(1 - nstate.done),
         extras={
             'policy_extras': policy_extras, 
             'state_extras': state_extras
-        })
+        },
+        priority=jnp.ones_like(nstate.done),
+        weight=jnp.ones_like(nstate.done),) 
 
 
 def generate_unroll(
@@ -503,7 +547,153 @@ class Evaluator:
         }
 
         return metrics  # pytype: disable=bad-return-type  # jax-ndarray
+    
 
+def reanalyze(data: MCTSTransition, 
+              forward: ForwardPass,
+              env: GymnaxToBraxWrapper,
+              key: jnp.ndarray) -> MCTSTransition:
+    data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (Config.num_minibatches, -1) 
+                                                        + x.shape[1:]), data)
+    
+    def f(carry_key, data: MCTSTransition):
+        new_key, key = jax.random.split(carry_key)
+        # TODO: env_state currently not saved! needs to be saved or restored from other data!
+        env_state = data.env_state
+        _, reanalyzed_data = actor_step(env, env_state, forward, key)
+
+        return new_key, reanalyzed_data
+        
+    _, reanalyzed_data = jax.lax.scan(
+        f, 
+        key,
+        data,
+        length=Config.num_minibatches)
+    
+    chex.assert_equal_shape(data.target_policy_probs, reanalyzed_data.target_policy_probs)
+    chex.assert_equal_shape(data.bootstrap_value, reanalyzed_data.bootstrap_value)
+    
+    data = data._replace(target_policy_probs=reanalyzed_data.target_policy_probs,
+                         bootstrap_value=reanalyzed_data.bootstrap_value)
+    data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
+                                    data)
+    
+    return data
+    
+
+def n_step_bootstrapped_targets(
+        rewards: jnp.ndarray,
+        discounts: jnp.ndarray,
+        termination_discount: jnp.ndarray,
+        observations: jnp.ndarray,
+        values: jnp.ndarray,
+        n: int = 5,
+        gamma: float = 1.,
+    ) -> jnp.ndarray:
+    """Computes n-step bootstrapped return targets over a sequence.
+
+    Args:
+        rewards: rewards at times [1, ..., T].
+        discounts: discounts at times [1, ..., T].
+        termination_discount: discount from termination at times [1, ..., T].
+        observations: observation at time [1, ...., T].
+        values: values at time [1, ...., T].
+        n: number of steps over which to accumulate reward before bootstrapping.
+
+    Returns:
+        estimated bootstrapped returns prefixes at times [0, ...., T-1]
+        observation to bootstrap from at times [0, ...., T-1]
+        discount factor for bootstrap value at times [0, ...., T-1]
+    """
+    chex.assert_type([rewards, discounts, values], float)
+    chex.assert_equal_shape_prefix([rewards, discounts, values], 1)
+    batch_shape = rewards.shape
+    seq_len = batch_shape[0]
+
+    # Shift bootstrap values by n and pad end of sequence with last value v_t[-1].
+    pad_size = min(n - 1, seq_len)
+    bootstrap_observations = jnp.concatenate([observations[n - 1:], jnp.array([observations[-1]] * pad_size)])
+    bootstrap_values = jnp.concatenate([values[n - 1:], jnp.array([values[-1]] * pad_size)])
+
+    # Pad sequences. Shape is now (T + n - 1, ...).
+    rewards = jnp.concatenate([rewards, jnp.zeros((n - 1,) + batch_shape[1:])])
+    discounts = jnp.concatenate([discounts, jnp.ones((n - 1,) + batch_shape[1:])]) * gamma
+
+    value_prefix_targets = jax.lax.dynamic_slice_in_dim(rewards, n-1, seq_len)
+    bootstrap_discounts = jnp.concatenate([termination_discount, jnp.ones((n - 1,) + batch_shape[1:])]) * gamma
+    bootstrap_discounts = jax.lax.dynamic_slice_in_dim(bootstrap_discounts, n-1, seq_len)
+
+    def f(carry, unused_t):
+        i, value_prefix_targets, bootstrap_discounts = carry
+        i -= 1
+        r_ = jax.lax.dynamic_slice_in_dim(rewards, i, seq_len)
+        discount_ = jax.lax.dynamic_slice_in_dim(discounts, i, seq_len)
+        value_prefix_targets = r_ + discount_ * value_prefix_targets
+        bootstrap_discounts *= discount_
+        return (i, value_prefix_targets, bootstrap_discounts), unused_t
+
+    (_, value_prefix_targets, bootstrap_discounts), _ = jax.lax.scan(
+        f, (n-1, value_prefix_targets, bootstrap_discounts),
+        (),
+        length=n-1)
+
+    return value_prefix_targets, bootstrap_observations, bootstrap_values, bootstrap_discounts
+
+
+def quantile_regression_loss(
+        values: jnp.ndarray,
+        targets: jnp.ndarray,
+        kappa: float,
+        num_atoms: int,
+    ) -> jnp.ndarray:
+    """Quantile regression loss from "Distributional Reinforcement Learning with Quantile
+    Regression" - Dabney et. al, 2017".
+
+    Args:
+        values: Predicted values for each quantile.
+        targets: Target values for each quantile.
+        kappa: Huber loss cutoff.
+        num_atoms: Number of buckets for the value function distribution.
+
+    Returns:
+        The computed value loss.
+    """
+    # Input `u' of Eq. 9.
+    bellman_errors = jnp.expand_dims(targets, -2) - jnp.expand_dims(values, -1)
+
+    # Eq. 9 of paper.
+    huber_loss = (
+        (jnp.abs(bellman_errors) <= kappa).astype(jnp.float32) *
+        0.5 * bellman_errors ** 2 +
+        (jnp.abs(bellman_errors) > kappa).astype(jnp.float32) *
+        kappa * (jnp.abs(bellman_errors) - 0.5 * kappa))
+
+    tau_hat = ((jnp.arange(num_atoms, dtype=jnp.float32) + 0.5) /
+               num_atoms)  # Quantile midpoints.  See Lemma 2 of paper.
+    # expand tau_hat to shape of bellman errors
+    tau_hat = jnp.expand_dims(tau_hat, (0, -1))
+
+    # Eq. 10 of paper.
+    tau_bellman_diff = jnp.abs(
+        tau_hat - (bellman_errors < 0).astype(jnp.float32))
+    quantile_huber_loss = tau_bellman_diff * huber_loss
+    # Sum over tau dimension, average over target value dimension.
+    loss = jnp.sum(jnp.mean(quantile_huber_loss, 2), 1)
+    return loss
+
+
+def mse_value_loss(values: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
+    """MSE loss for value function.
+
+    Args:
+        values: Predicted values for each quantile.
+        targets: Target values for each quantile.
+
+    Returns:
+        The computed value loss.
+    """
+    v_error = jax.lax.stop_gradient(targets) - values
+    return jnp.squeeze(v_error * v_error * 0.5)
 
 def compute_muzero_loss(
     params: Union[PPONetworkParams, AtariPPONetworkParams],
@@ -511,9 +701,11 @@ def compute_muzero_loss(
     data: MCTSTransition,
     rng: jnp.ndarray,
     ppo_network: Union[PPONetworks, AtariPPONetworks],
+    value_loss_fn: Callable[[Any], jnp.ndarray],
     vf_cost: float = 0.5,
     l2_coef: float = 1e-4,
     shared_feature_extractor: bool = False,
+    per_importance_sampling: bool = True,
 ) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
     """Computes Alphazero loss .
 
@@ -563,9 +755,11 @@ def compute_muzero_loss(
     policy_loss = -jnp.mean(jnp.sum(jax.lax.stop_gradient(policy_targets)*(jax.nn.log_softmax(policy_logits)), axis=-1))
 
     # Value function loss
-    vs = data.target_value
-    v_error = jax.lax.stop_gradient(vs) - baseline
-    v_loss = jnp.mean(v_error * v_error) * 0.5 * vf_cost
+    vs = jnp.expand_dims(data.value_prefix_target, -1) + jnp.expand_dims(data.bootstrap_discount, -1) * data.bootstrap_value
+    v_losses = value_loss_fn(baseline, jax.lax.stop_gradient(vs))
+    if per_importance_sampling:
+        v_losses *= data.weight
+    v_loss = vf_cost * jnp.mean(v_losses)
 
     # l2 penalty
     l2_penalty = l2_coef * 0.5 * sum(
@@ -694,7 +888,11 @@ def main(_):
         discount=0.,
         next_observation=dummy_obs,
         target_policy_probs=jnp.zeros((action_size,)),
-        target_value=0.,
+        search_value=jnp.zeros(Config.num_atoms),
+        value_prefix_target=0.,
+        bootstrap_observation=dummy_obs,
+        bootstrap_value=jnp.zeros(Config.num_atoms),
+        bootstrap_discount=0.,
         extras={
             'state_extras': {
                 'truncation': 0.
@@ -703,11 +901,21 @@ def main(_):
                 'prior_log_prob': 0.,
                 'raw_action': 0.
             }
-        })
-    replay_buffer = replay_buffers.UniformSamplingQueue( # UniformSamplingQueue Queue
-        max_replay_size=max_replay_size // device_count,
-        dummy_data_sample=dummy_transition,
-        sample_batch_size=Config.replay_buffer_batch_size * Config.num_minibatches // device_count)
+        },
+        priority=0.,
+        weight=0.,)
+    
+    if Config.per_alpha > -1:
+        replay_buffer = replay_buffers.PrioritizedSamplingQueue( # UniformSamplingQueue Queue PrioritizedSamplingQueue
+            max_replay_size=max_replay_size // device_count,
+            dummy_data_sample=dummy_transition,
+            sample_batch_size=Config.replay_buffer_batch_size * Config.num_minibatches // device_count,
+            per_importance_sampling_beta=Config.per_importance_sampling_beta)
+    else: 
+        replay_buffer = replay_buffers.UniformSamplingQueue( # UniformSamplingQueue Queue PrioritizedSamplingQueue
+            max_replay_size=max_replay_size // device_count,
+            dummy_data_sample=dummy_transition,
+            sample_batch_size=Config.replay_buffer_batch_size * Config.num_minibatches // device_count)
     
 
     # Normalize moved from env to network
@@ -718,6 +926,7 @@ def main(_):
     ppo_network = make_ppo_networks(
         observation_size=observation_shape, # NOTE only works with flattened observation space
         action_size=action_size, # flatten action size for nested spaces
+        num_atoms=Config.num_atoms,
         preprocess_observation_fn=normalize, 
         policy_hidden_layer_sizes=Config.policy_hidden_layer_sizes, 
         value_hidden_layer_sizes=Config.value_hidden_layer_sizes,
@@ -744,13 +953,30 @@ def main(_):
         optax.adam(learning_rate),
     )
 
+    n_step_fn = partial(n_step_bootstrapped_targets, n=Config.n_step_n, gamma=Config.n_step_gamma)
+
+    if Config.num_atoms > 1:
+        value_loss_fn = partial(quantile_regression_loss, kappa=Config.qr_kappa, num_atoms=Config.num_atoms)
+    elif Config.num_atoms == 1:
+        value_loss_fn = mse_value_loss
+    else:
+        raise ValueError('num_atoms must be a positive integer.')
+
+    if Config.reanalyze:
+        raise NotImplementedError
+        # reanalyze_fn = reanalyze
+    else:
+        reanalyze_fn = lambda x, a, b, c: x
+
     # create loss function via functools.partial
     loss_fn = partial(
         compute_muzero_loss,
         ppo_network=ppo_network,
+        value_loss_fn=value_loss_fn,
         vf_cost=Config.vf_cost,
         l2_coef=Config.l2_coef,
         shared_feature_extractor=is_atari,
+        per_importance_sampling=Config.per_importance_sampling,
     )
 
 
@@ -819,7 +1045,7 @@ def main(_):
         key, key_perm, key_grad = jax.random.split(key, 3)
 
         def convert_data(x: jnp.ndarray):
-            x = jax.random.permutation(key_perm, x)
+            x = jax.random.permutation(key_perm, x) # TODO unnecessary: data already randomly sampled from buffer
             x = jnp.reshape(x, (Config.num_minibatches, -1) + x.shape[1:])
             return x
 
@@ -837,7 +1063,7 @@ def main(_):
         unused_t
     ) -> Tuple[Tuple[TrainingState, State, ReplayBufferState, jnp.ndarray], Metrics]:
         training_state, state, buffer_state, key = carry
-        key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
+        key_sgd, key_generate_unroll, key_bootstrap, reanalyze_key, new_key = jax.random.split(key, 5)
 
         forward_fn = make_forward(
             (training_state.normalizer_params, training_state.params.policy, 
@@ -853,6 +1079,29 @@ def main(_):
             deterministic_actions=False,
             extra_fields=('truncation',))
         
+        # additional search at final step for bootstrap values
+        _, transition = actor_step(
+            env, state, forward_fn, key_bootstrap, 
+            deterministic_actions=False, 
+            extra_fields=('truncation',))
+        
+        assert data.discount.shape[0] == Config.unroll_length
+
+        value_prefix_targets, bootstrap_observations, bootstrap_values, bootstrap_discounts = n_step_fn(
+            rewards=data.reward,
+            discounts=data.discount * (1 - data.extras['state_extras']['truncation']),
+            termination_discount=data.discount,
+            observations=data.next_observation,
+            values=jnp.concatenate([data.search_value[1:], jnp.array([transition.search_value])]),
+        )
+
+        # NOTE: data.bootstap_value is overloaded with the prior values
+        targets = jnp.expand_dims(value_prefix_targets, -1) + jnp.expand_dims(bootstrap_discounts, -1) * bootstrap_values
+        priorities = (jnp.mean(jnp.abs(targets - data.bootstrap_value), axis=-1) + 1e-10)**Config.per_alpha
+
+        data = data._replace(value_prefix_target=value_prefix_targets, bootstrap_observation=bootstrap_observations,
+                      bootstrap_value=bootstrap_values, bootstrap_discount=bootstrap_discounts, priority=priorities)
+        
         # Have leading dimensions (batch_size * num_minibatches, unroll_length)
         # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
         data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
@@ -861,9 +1110,8 @@ def main(_):
         assert data.discount.shape[0] == Config.unroll_length * Config.num_envs
         chex.assert_shape(data.observation, [Config.unroll_length * Config.num_envs] + list(observation_shape))
 
-        # TODO BUFFER probably reshaping / flattening data needed
-        # NOTE we might want to keep the current structure nonetheless to keep episodes intact 
-        # following muzeros further training stuff (re-analyze etc.)
+        # NOTE we might want to keep the non-flattened data to keep episodes intact 
+        # following muzeros further training stuff (re-analyze, GAE etc.)
 
         buffer_state = replay_buffer.insert(buffer_state, data)
 
@@ -875,6 +1123,9 @@ def main(_):
         
         # sampling from replay buffer
         buffer_state, data = replay_buffer.sample(buffer_state)
+
+        # reanalyze
+        # data = reanalyze_fn(data, forward_fn, env, reanalyze_key)
         
         (optimizer_state, params, _), metrics = jax.lax.scan(
             partial(sgd_step, data=data, normalizer_params=normalizer_params),
@@ -886,6 +1137,12 @@ def main(_):
             params=params,
             normalizer_params=normalizer_params,
             env_steps=training_state.env_steps + env_step_per_training_step) 
+        
+        # update replay priorities
+        targets = jnp.expand_dims(data.value_prefix_target, -1) + jnp.expand_dims(data.bootstrap_discount, -1) * data.bootstrap_value
+        values = forward_fn(data.observation)[1]
+        priorities = (jnp.mean(jnp.abs(targets - values), axis=-1) + 1e-10)**Config.per_alpha
+        buffer_state = replay_buffer.set_priorities(buffer_state, jnp.squeeze(priorities))
         
         metrics['buffer_current_size'] = replay_buffer.size(buffer_state)
         return (new_training_state, state, buffer_state, new_key), metrics
@@ -1039,6 +1296,68 @@ def main(_):
         logging.info(metrics)
         # progress_fn(0, metrics)
 
+        # plotting: TEMP, REMOVE AGAIN ###########################################
+        # plotting_forwad = make_forward((_unpmap(
+        #         (training_state.normalizer_params, training_state.params.policy, 
+        #          training_state.params.value, training_state.params.feature_extractor)
+        #         )))
+        # deterministic_actions = True
+        # plotting_key = jax.random.PRNGKey(17)
+        # reset_key, unroll_key = jax.random.split(plotting_key)
+        # reset_keys = jax.random.split(reset_key, Config.num_eval_envs)
+        # plotting_state = eval_env.reset(reset_keys)
+
+        # step_count = 0
+        # while plotting_state.done[0] < 1 and plotting_state.info['truncation'][0] < 1:
+        #     print(step_count)
+        #     search_rng, unroll_key = jax.random.split(unroll_key)
+        
+        #     prior_logits, value = plotting_forwad(plotting_state.obs)
+        #     use_mixed_value = False
+        #     root = mctx.RootFnOutput(
+        #         prior_logits=prior_logits,
+        #         value=value,
+        #         embedding=plotting_state, 
+        #     )
+
+        #     def recurrent_fn(params, rng_key, action, embedding):
+        #         env_state = embedding
+        #         nstate = eval_env.step(env_state, action)
+        #         prior_logits, value = plotting_forwad(env_state.obs)
+
+        #         recurrent_fn_output = mctx.RecurrentFnOutput(
+        #             reward=nstate.reward,
+        #             discount=1 - nstate.done,
+        #             prior_logits=prior_logits,
+        #             value=value,
+        #         )
+        #         return recurrent_fn_output, nstate
+
+        #     policy_output = mctx.gumbel_muzero_policy(
+        #         params=(),
+        #         rng_key=search_rng,
+        #         root=root,
+        #         recurrent_fn=recurrent_fn,
+        #         num_simulations=Config.num_simulations,
+        #         max_num_considered_actions=Config.max_num_considered_actions,
+        #         qtransform=partial(
+        #             mctx.qtransform_completed_by_mix_value,
+        #             use_mixed_value=use_mixed_value),
+        #     )
+
+        #     actions = policy_output.action
+        #     action_weights = policy_output.action_weights
+        #     best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
+        #     actions = jax.lax.select(deterministic_actions, best_actions, actions)
+            
+        #     mctx.draw_tree_to_file(policy_output.search_tree, f'plots/search_tree_00_{step_count}.png')
+
+        #     plotting_state = eval_env.step(plotting_state, actions)
+        #     step_count += 1
+        # plotting: TEMP, REMOVE AGAIN ###########################################
+
+            
+
     # prefill replay buffer
     start_prefill = time.time()
     logging.info('prefilling replay buffer')
@@ -1107,6 +1426,67 @@ def main(_):
             # OPTIONAL: save checkpoints of models here
             # params = _unpmap(
             #     (training_state.normalizer_params, training_state.params.policy))
+
+            # plotting: TEMP, REMOVE AGAIN ###########################################
+            # plotting_forwad = make_forward((_unpmap(
+            #         (training_state.normalizer_params, training_state.params.policy, 
+            #         training_state.params.value, training_state.params.feature_extractor)
+            #         )))
+            # deterministic_actions = True
+            # plotting_key = jax.random.PRNGKey(17)
+            # reset_key, unroll_key = jax.random.split(plotting_key)
+            # reset_keys = jax.random.split(reset_key, Config.num_eval_envs)
+            # plotting_state = eval_env.reset(reset_keys)
+
+            # step_count = 0
+            # while plotting_state.done[0] < 1 and plotting_state.info['truncation'][0] < 1:
+            #     print(step_count)
+            #     search_rng, unroll_key = jax.random.split(unroll_key)
+            
+            #     prior_logits, value = plotting_forwad(plotting_state.obs)
+            #     print(value)
+            #     use_mixed_value = False
+            #     root = mctx.RootFnOutput(
+            #         prior_logits=prior_logits,
+            #         value=value,
+            #         embedding=plotting_state, 
+            #     )
+
+            #     def recurrent_fn(params, rng_key, action, embedding):
+            #         env_state = embedding
+            #         nstate = eval_env.step(env_state, action)
+            #         prior_logits, value = plotting_forwad(env_state.obs)
+
+            #         recurrent_fn_output = mctx.RecurrentFnOutput(
+            #             reward=nstate.reward,
+            #             discount=1 - nstate.done,
+            #             prior_logits=prior_logits,
+            #             value=value,
+            #         )
+            #         return recurrent_fn_output, nstate
+
+            #     policy_output = mctx.gumbel_muzero_policy(
+            #         params=(),
+            #         rng_key=search_rng,
+            #         root=root,
+            #         recurrent_fn=recurrent_fn,
+            #         num_simulations=Config.num_simulations,
+            #         max_num_considered_actions=Config.max_num_considered_actions,
+            #         qtransform=partial(
+            #             mctx.qtransform_completed_by_mix_value,
+            #             use_mixed_value=use_mixed_value),
+            #     )
+
+            #     actions = policy_output.action
+            #     action_weights = policy_output.action_weights
+            #     best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
+            #     actions = jax.lax.select(deterministic_actions, best_actions, actions)
+                
+            #     mctx.draw_tree_to_file(policy_output.search_tree, f'plots/search_tree_{it}_{step_count}.png')
+
+            #     plotting_state = eval_env.step(plotting_state, actions)
+            #     step_count += 1
+            # plotting: TEMP, REMOVE AGAIN ###########################################
 
 
     # END OF TRAINING

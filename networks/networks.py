@@ -170,18 +170,20 @@ def make_policy_network(
 
 def make_value_network(
     obs_size: int,
+    num_atoms: int = 1,
     preprocess_observation_fn: Callable = identity_observation_preprocessor,
     hidden_layer_sizes: Sequence[int] = (256, 256),
     activation: ActivationFn = linen.relu) -> FeedForwardNetwork:
     """Creates a policy network."""
     value_module = MLP(
-        layer_sizes=list(hidden_layer_sizes) + [1],
+        layer_sizes=list(hidden_layer_sizes) + [num_atoms],
         activation=activation,
         kernel_init=jax.nn.initializers.lecun_uniform())
 
     def apply(processor_params, policy_params, obs):
         obs = preprocess_observation_fn(obs, processor_params)
-        return jnp.squeeze(value_module.apply(policy_params, obs), axis=-1)
+        # return jnp.squeeze(value_module.apply(policy_params, obs), axis=-1)
+        return value_module.apply(policy_params, obs)
 
     dummy_obs = jnp.zeros((1,) + obs_size) # jnp.zeros((1, obs_size))
     return FeedForwardNetwork(

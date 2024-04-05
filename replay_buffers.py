@@ -63,6 +63,7 @@ class ReplayBufferState:
     insert_position: jnp.ndarray
     sample_position: jnp.ndarray
     key: PRNGKey
+    current_sample_indices: jnp.ndarray
 
 
 class QueueBase(ReplayBuffer[ReplayBufferState, Sample], Generic[Sample]):
@@ -101,6 +102,7 @@ class QueueBase(ReplayBuffer[ReplayBufferState, Sample], Generic[Sample]):
             sample_position=jnp.zeros((), jnp.int32),
             insert_position=jnp.zeros((), jnp.int32),
             key=key,
+            current_sample_indices=jnp.zeros(self._sample_batch_size, jnp.int32),
         )
 
     def check_can_insert(self, buffer_state, samples, shards):
@@ -163,6 +165,9 @@ class QueueBase(ReplayBuffer[ReplayBufferState, Sample], Generic[Sample]):
 
     def size(self, buffer_state: ReplayBufferState) -> int:
         return buffer_state.insert_position - buffer_state.sample_position  # pytype: disable=bad-return-type  # jax-ndarray
+    
+    def set_priorities(self, buffer_state: ReplayBufferState, priorities: jnp.ndarray):
+        return buffer_state
 
 
 class Queue(QueueBase[Sample], Generic[Sample]):
@@ -231,7 +236,8 @@ class Queue(QueueBase[Sample], Generic[Sample]):
         if self._cyclic:
             sample_position = sample_position % buffer_state.insert_position
 
-        new_state = buffer_state.replace(sample_position=sample_position)
+        new_state = buffer_state.replace(sample_position=sample_position,
+                                         current_sample_indices=idx)
         return new_state, self._unflatten_fn(flat_batch)
 
     def size(self, buffer_state: ReplayBufferState) -> int:
@@ -268,7 +274,69 @@ class UniformSamplingQueue(QueueBase[Sample], Generic[Sample]):
             maxval=buffer_state.insert_position,
         )
         batch = jnp.take(buffer_state.data, idx, axis=0, mode='wrap')
-        return buffer_state.replace(key=key), self._unflatten_fn(batch)
+        return buffer_state.replace(key=key, current_sample_indices=idx), self._unflatten_fn(batch)
+    
+
+class PrioritizedSamplingQueue(QueueBase[Sample], Generic[Sample]):
+    """Implements an prioritized sampling limited-size replay queue.
+    See https://arxiv.org/pdf/1803.00933.pdf.
+
+    * It behaves as a limited size queue (if buffer is full it removes the oldest
+        elements when new one is inserted).
+    * It supports batch insertion only (no single element)
+    * It performs prioritized sampling based on TD errors with replacement of a batch of size
+        `sample_batch_size`
+    """
+    def __init__(
+        self,
+        max_replay_size: int,
+        dummy_data_sample: Sample,
+        sample_batch_size: int,
+        per_importance_sampling_beta: float = 0,
+    ):
+        super().__init__(
+            max_replay_size=max_replay_size,
+            dummy_data_sample=dummy_data_sample,
+            sample_batch_size=sample_batch_size,
+        )
+        self.per_importance_sampling_beta = per_importance_sampling_beta
+
+    def sample_internal(
+        self, buffer_state: ReplayBufferState
+    ) -> Tuple[ReplayBufferState, Sample]:
+        if buffer_state.data.shape != self._data_shape:
+            raise ValueError(
+                f'Data shape expected by the replay buffer ({self._data_shape}) does '
+                f'not match the shape of the buffer state ({buffer_state.data.shape})'
+            )
+
+        key, sample_key = jax.random.split(buffer_state.key)
+
+        data = buffer_state.data
+        indices = jnp.arange(len(data))
+        probs = jnp.where(indices < buffer_state.insert_position, 
+                          data[:, -2], 0.) 
+        probs /= jnp.sum(probs)
+        idx = jax.random.choice(
+            sample_key,
+            indices,
+            (self._sample_batch_size,),
+            replace=True,
+            p=probs,
+        )
+
+        # update weights
+        loss_weights = 1.0 / (buffer_state.insert_position * probs + 1e-10)**self.per_importance_sampling_beta
+        loss_weights /= jnp.max(loss_weights)
+
+        buffer_state = buffer_state.replace(data=buffer_state.data.at[:, -1].set(loss_weights))
+
+        batch = jnp.take(buffer_state.data, idx, axis=0, mode='wrap')
+        return buffer_state.replace(key=key, current_sample_indices=idx), self._unflatten_fn(batch)
+    
+    def set_priorities(self, buffer_state: ReplayBufferState, priorities: jnp.ndarray):
+        idx = buffer_state.current_sample_indices
+        return buffer_state.replace(data=buffer_state.data.at[idx, -2].set(priorities))
 
 
 class PmapWrapper(ReplayBuffer[State, Sample]):

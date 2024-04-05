@@ -22,5 +22,11 @@ class MCTSTransition(NamedTuple):
     discount: NestedArray
     next_observation: NestedArray
     target_policy_probs: NestedArray
-    target_value: NestedArray
-    extras: NestedArray = ()  # pytype: disable=annotation-type-mismatch  # jax-ndarray
+    search_value: NestedArray
+    value_prefix_target: NestedArray
+    bootstrap_observation: NestedArray
+    bootstrap_value: NestedArray
+    bootstrap_discount: NestedArray
+    extras: NestedArray  # pytype: disable=annotation-type-mismatch  # jax-ndarray
+    priority: NestedArray
+    weight: NestedArray
