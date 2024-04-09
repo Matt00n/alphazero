@@ -122,6 +122,118 @@ def muzero_policy(
       search_tree=search_tree)
 
 
+def sampled_muzero_policy(
+    params: base.Params,
+    rng_key: chex.PRNGKey,
+    root: base.RootFnOutput,
+    recurrent_fn: base.RecurrentFn,
+    num_simulations: int,
+    num_samples: int = 100,
+    invalid_actions: Optional[chex.Array] = None,
+    max_depth: Optional[int] = None,
+    loop_fn: base.LoopFn = jax.lax.fori_loop,
+    *,
+    qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
+    dirichlet_fraction: chex.Numeric = 0.25,
+    dirichlet_alpha: chex.Numeric = 0.3,
+    pb_c_init: chex.Numeric = 1.25,
+    pb_c_base: chex.Numeric = 19652,
+    temperature: chex.Numeric = 1.0,
+    sampling_dist_temperature: chex.Numeric = 1.0) -> base.PolicyOutput[None]:
+  """Runs Sampled MuZero search and returns the `PolicyOutput`.
+
+  This policy implements Sampled MuZero from
+  "Learning and Planning in Complex Action Spaces".
+  https://arxiv.org/pdf/2104.06303.pdf
+
+  In the shape descriptions, `B` denotes the batch dimension.
+
+  Args:
+    params: params to be forwarded to root and recurrent functions.
+    rng_key: random number generator state, the key is consumed.
+    root: a `(prior_logits, value, embedding)` `RootFnOutput`. The
+      `prior_logits` are from a policy network. The shapes are
+      `([B, num_actions], [B], [B, ...])`, respectively.
+    recurrent_fn: a callable to be called on the leaf nodes and unvisited
+      actions retrieved by the simulation step, which takes as args
+      `(params, rng_key, action, embedding)` and returns a `RecurrentFnOutput`
+      and the new state embedding. The `rng_key` argument is consumed.
+    num_simulations: the number of simulations.
+    num_samples: number of samples drawn to construct the empiciral distribution.
+    invalid_actions: a mask with invalid actions. Invalid actions
+      have ones, valid actions have zeros in the mask. Shape `[B, num_actions]`.
+    max_depth: maximum search tree depth allowed during simulation.
+    loop_fn: Function used to run the simulations. It may be required to pass
+      hk.fori_loop if using this function inside a Haiku module.
+    qtransform: function to obtain completed Q-values for a node.
+    dirichlet_fraction: float from 0 to 1 interpolating between using only the
+      prior policy or just the Dirichlet noise.
+    dirichlet_alpha: concentration parameter to parametrize the Dirichlet
+      distribution.
+    pb_c_init: constant c_1 in the PUCT formula.
+    pb_c_base: constant c_2 in the PUCT formula.
+    temperature: temperature for acting proportionally to
+      `visit_counts**(1 / temperature)`.
+    sampling_dist_temperature: temperature for constructing the sampling distribution:
+      beta = pi**(1 / tau)
+
+  Returns:
+    `PolicyOutput` containing the proposed action, action_weights and the used
+    search tree.
+  """
+  rng_key, sample_dist_key, dirichlet_rng_key, search_rng_key = jax.random.split(rng_key, 4)
+
+  # Adding Dirichlet noise.
+  noisy_logits = _get_logits_from_probs(
+      _add_dirichlet_noise(
+          dirichlet_rng_key,
+          jax.nn.softmax(root.prior_logits),
+          dirichlet_fraction=dirichlet_fraction,
+          dirichlet_alpha=dirichlet_alpha))
+  
+  # replace root.prior_logits with sample based probs
+  empirical_probs = _get_empirical_probs(logits=_mask_invalid_actions(noisy_logits, invalid_actions), 
+                                         temperature=sampling_dist_temperature, 
+                                         num_samples=num_samples, 
+                                         key=sample_dist_key)
+  root = root.replace(
+      prior_logits=empirical_probs)
+  
+  transformed_recurrent_fn = _make_sampled_recurrent_fn(recurrent_fn, sampling_dist_temperature, num_samples)
+
+  # Running the search.
+  interior_action_selection_fn = functools.partial(
+      action_selection.sampled_muzero_action_selection,
+      pb_c_base=pb_c_base,
+      pb_c_init=pb_c_init,
+      qtransform=qtransform)
+  root_action_selection_fn = functools.partial(
+      interior_action_selection_fn,
+      depth=0)
+  search_tree = search.search(
+      params=params,
+      rng_key=search_rng_key,
+      root=root,
+      recurrent_fn=transformed_recurrent_fn,
+      root_action_selection_fn=root_action_selection_fn,
+      interior_action_selection_fn=interior_action_selection_fn,
+      num_simulations=num_simulations,
+      max_depth=max_depth,
+      invalid_actions=invalid_actions,
+      loop_fn=loop_fn)
+
+  # Sampling the proposed action proportionally to the visit counts.
+  summary = search_tree.summary()
+  action_weights = summary.visit_probs
+  action_logits = _apply_temperature(
+      _get_logits_from_probs(action_weights), temperature)
+  action = jax.random.categorical(rng_key, action_logits)
+  return base.PolicyOutput(
+      action=action,
+      action_weights=action_weights,
+      search_tree=search_tree)
+
+
 def gumbel_muzero_policy(
     params: base.Params,
     rng_key: chex.PRNGKey,
@@ -410,6 +522,48 @@ def _apply_temperature(logits, temperature):
   logits = logits - jnp.max(logits, keepdims=True, axis=-1)
   tiny = jnp.finfo(logits.dtype).tiny
   return logits / jnp.maximum(tiny, temperature)
+
+
+# Utility function to set the values of certain indices to prescribed values.
+# This is vmapped to operate seamlessly on batches.
+def construct_empirical_dist(x, *indices):
+  return x.at[indices].add(1.)
+
+batch_construct_empirical_dist = jax.vmap(construct_empirical_dist)
+
+def _get_empirical_probs(logits, temperature, num_samples, key):
+  """Computes sample-based probabilities to be used in the PUCB formula following 
+  https://arxiv.org/pdf/2104.06303.pdf"""
+  sample_dist_logits = _apply_temperature(logits, temperature)
+  empirical_probs = jnp.zeros_like(sample_dist_logits)
+  sample_dist_logits = jnp.expand_dims(sample_dist_logits, axis=1)
+  batch_size = empirical_probs.shape[0]
+  samples = jax.random.categorical(key, sample_dist_logits, shape=(batch_size, num_samples))
+  empirical_probs = batch_construct_empirical_dist(empirical_probs, samples) / num_samples
+
+  # see remark in chapter 5.1 in the paper
+  prior_probs = jax.nn.softmax(logits)
+  return empirical_probs * prior_probs**(1 - 1/temperature)
+
+def _make_sampled_recurrent_fn(
+  recurrent_fn: base.RecurrentFn, 
+  temperature: float, 
+  num_samples: int,
+) -> base.RecurrentFn:
+  """Wraps a recurrent_fn to compute sample-based probabilities to be used 
+  in the PUCB formula following https://arxiv.org/pdf/2104.06303.pdf"""
+
+  def sampled_recurrent_fn(params, rng_key, action, state):
+    rng_key, sample_key = jax.random.split(rng_key)
+    recurrent_fn_output, nstate = recurrent_fn(params, rng_key, action, state)
+    empirical_probs = _get_empirical_probs(logits=recurrent_fn_output.prior_logits, 
+                                            temperature=temperature, 
+                                            num_samples=num_samples, 
+                                            key=sample_key)
+    recurrent_fn_output.replace(prior_logits=empirical_probs)
+    return recurrent_fn_output, nstate
+  
+  return sampled_recurrent_fn
 
 
 def _make_stochastic_recurrent_fn(

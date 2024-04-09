@@ -114,7 +114,7 @@ class Config:
     max_num_considered_actions = 16
     l2_coef = 1e-4
     vf_cost = 0.5
-    n_step_gamma = 1.
+    n_step_gamma = 0.99
     n_step_n = 5
 
     # quantile regression
