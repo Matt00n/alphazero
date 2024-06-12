@@ -24,10 +24,7 @@
 # TODO MUZERO REANALYZE: option for reanalyzing data in buffer
 # TODO MUZERO REANALYZE: target network (for value), which is updated infrequently
 # TODO MUZERO REANALYZE: reanalyze highest reward states (exploit rare events)
-# TODO SAMPLED MUZERO: Look into sampling of actions here vs gumbel muzero
-# TODO mixture of gumbel muzero and muzero? gumbel only for root action selection, other pucb?
-# TODO test evaluation with gumbel scale set to zero (requires passing in mctx policy as argument)
-# TODO SAMPLED MUZERO: support for continuous action spaces
+# DONE SAMPLED MUZERO: sampling of actions / main algorithm
 # DONE ALPHATENSOR: quantile regression distributional loss for value function
 # TODO ALPHATENSOR: option for implicit quantile networks (IQN) distributional loss for value function
 # TODO ALPHATENSOR: sub-tree persistence --> subtree of selected action is reused in next search
@@ -37,8 +34,7 @@
 
 # CURRENT FOCUS
 # target network for value
-# REANALYZE
-# Sampled Muzero
+# REANALYZE: requires saving env_state in mctsTransition
 
 # TODO: look into running jax on (M1) GPU: Gymnax, Jax docs, Jax metal
 # TODO: clean up and organize code / folders
@@ -51,6 +47,7 @@
 # Optional / future research
 # TODO incorporate GAE into tree search to construct targets: difficulty: reanalyze --> needs restructuring of buffer to store episodes
 # TODO MCTS replay vs rollout buffer
+# TODO SAMPLED MUZERO: support for continuous action spaces
 
 
 
@@ -399,7 +396,7 @@ def actor_step(
     #         use_mixed_value=use_mixed_value),
     # )
 
-    policy_output = mctx.muzero_policy(
+    policy_output = mctx.sampled_muzero_policy(
         params=(),
         rng_key=search_rng,
         root=root,

@@ -18,6 +18,7 @@ from mctx_dist._src.action_selection import gumbel_muzero_interior_action_select
 from mctx_dist._src.action_selection import gumbel_muzero_root_action_selection
 from mctx_dist._src.action_selection import GumbelMuZeroExtraData
 from mctx_dist._src.action_selection import muzero_action_selection
+from mctx_dist._src.action_selection import sampled_muzero_action_selection
 from mctx_dist._src.base import ChanceRecurrentFnOutput
 from mctx_dist._src.base import DecisionRecurrentFnOutput
 from mctx_dist._src.base import InteriorActionSelectionFn
@@ -31,11 +32,13 @@ from mctx_dist._src.base import RootFnOutput
 from mctx_dist._src.policies import gumbel_muzero_policy
 from mctx_dist._src.policies import muzero_policy
 from mctx_dist._src.policies import stochastic_muzero_policy
+from mctx_dist._src.policies import sampled_muzero_policy
 from mctx_dist._src.qtransforms import qtransform_by_min_max
 from mctx_dist._src.qtransforms import qtransform_by_parent_and_siblings
 from mctx_dist._src.qtransforms import qtransform_completed_by_mix_value
 from mctx_dist._src.search import search
-from mctx_dist._src.tree import Tree, draw_tree_to_file
+from mctx_dist._src.tree import Tree
+from mctx_dist._src.tree import draw_tree_to_file
 
 __version__ = "0.0.5"
 
@@ -55,6 +58,8 @@ __all__ = (
     "gumbel_muzero_interior_action_selection",
     "gumbel_muzero_policy",
     "gumbel_muzero_root_action_selection",
+    "sampled_muzero_action_selection",
+    "sampled_muzero_policy",
     "muzero_action_selection",
     "muzero_policy",
     "qtransform_by_min_max",
@@ -62,6 +67,7 @@ __all__ = (
     "qtransform_completed_by_mix_value",
     "search",
     "stochastic_muzero_policy",
+    "draw_tree_to_file",
 )
 
 #  _________________________________________
