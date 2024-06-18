@@ -57,7 +57,7 @@ class Config:
     save_scores = False
 
     # environment
-    env_id = 'Breakout-MinAtar' # CartPole-v1, Breakout-MinAtar
+    env_id = 'CartPole-v1' # CartPole-v1, Breakout-MinAtar
     num_envs = 16
     normalize_observations = True 
     action_repeat = 1
@@ -66,7 +66,7 @@ class Config:
     eval_every = 1
     deterministic_eval = True
     num_eval_envs = 64
-    episode_length = 1000
+    episode_length = 500
 
     # algorithm hyperparameters
     total_timesteps = int(1e6) 
@@ -75,8 +75,8 @@ class Config:
     anneal_lr = True
     gamma = 0.99 
     gae_lambda = 0.95
-    batch_size = 1 # number of unrolls per minibatch 
-    num_minibatches = 64
+    batch_size = 8 # number of unrolls per minibatch 
+    num_minibatches = 8
     update_epochs = 10
     normalize_advantages = True
     clip_eps = 0.2
@@ -503,11 +503,11 @@ def compute_ppo_loss(
     policy_logits = policy_apply(normalizer_params, params.policy,
                                 hidden)
 
-    baseline = value_apply(normalizer_params, params.value, hidden)
+    baseline = jnp.squeeze(value_apply(normalizer_params, params.value, hidden))
 
     
-    bootstrap_value = value_apply(normalizer_params, params.value,
-                                    hidden_boot)
+    bootstrap_value = jnp.squeeze(value_apply(normalizer_params, params.value,
+                                    hidden_boot))
 
     rewards = data.reward * reward_scaling
     truncation = data.extras['state_extras']['truncation']
@@ -639,7 +639,7 @@ def main(_):
     if is_atari:
         observation_shape = env_state.obs.shape[-3:]
     else:
-        observation_shape = env_state.obs.shape[-1]
+        observation_shape = env_state.obs.shape[-1:]
 
     # Normalize moved from env to network
     normalize = lambda x, y: x
