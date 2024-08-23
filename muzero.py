@@ -1,55 +1,4 @@
-"""Muzero reimplementation."""
-
-# DONE: Compatibility with Jax environment
-# DONE: Port to Gymnax (convert Gymnax API to Brax (done), modify gymnax to return truncated flags (done), env returns only jax arrays (done))
-# DONE ENV: Ensure that scores are maintained 
-# DONE ENV: dissolve all dependency issues in subfiles
-# TODO ENV: visualizer
-# DONE Blueprint of all Muzero elements
-# DONE MCTS: Adapt policy learning
-# DONE MCTS: Replay Buffers from Brax (logic for prefilling buffer before training)
-# TODO MCTS: keep options for both replay & rollout buffer --> test to see what works better in target use case
-# (Temp solution: Comment out sampling from buffer in training_step)
-# NOT NEEDED (handled internally by mcts via discounts): Auto reset not wanted in MCTS rollouts
-
-# Adapt implementation details from further papers: EfficientZero, Reanalyze, Sampled Muzero, Gumble Muzero, AlphaTensor, AlphaDev, DreamerV3
-
-# DONE MUZERO: Prioritized replay buffer (see https://github.com/werner-duvaud/muzero-general/tree/master 
-# and https://github.com/YeWR/EfficientZero/blob/main/core/replay_buffer.py)
-# DONE MUZERO: Categorical value function (QR from AlphaTensor instead of MuZeros version)
-# DONE MUZERO: n-step value targets
-# TODO MUZERO: Learn Model
-# NOTE: Muzero samples trajectories during training: unrolls model in parallel to true trajectory and then computes loss for every step.
-#           We do not do this since we do not train a model anyway --> apply policy / value to true observation instead of its representation.
-# TODO MUZERO REANALYZE: option for reanalyzing data in buffer
-# TODO MUZERO REANALYZE: target network (for value), which is updated infrequently
-# TODO MUZERO REANALYZE: reanalyze highest reward states (exploit rare events)
-# DONE SAMPLED MUZERO: sampling of actions / main algorithm
-# DONE ALPHATENSOR: quantile regression distributional loss for value function
-# TODO ALPHATENSOR: option for implicit quantile networks (IQN) distributional loss for value function
-# TODO ALPHATENSOR: sub-tree persistence --> subtree of selected action is reused in next search
-# TODO ALPHATENSOR: bootstrapping during search not with mean value but risk-seeking value (average of quantiles above 75%)
-# (since deterministic env and only interested in best action) (ALSO SEE https://github.com/bwfbowen/muax/tree/main/muax
-# and https://github.com/werner-duvaud/muzero-general/blob/master/models.py for example)
-
-# CURRENT FOCUS
-# target network for value
-# REANALYZE: requires saving env_state in mctsTransition
-
-# TODO: look into running jax on (M1) GPU: Gymnax, Jax docs, Jax metal
-# TODO: clean up and organize code / folders
-# DONE Test with Gymnax environments
-# TODO MCTS: option for different MCTS versions from MCTX
-# TODO pass in mcts policy as argument so that we can partial it before
-# DONE make eval deterministic (as option) 
-# TODO potentially change generate unroll to generate episodes (remove auto reset and reset manually after unroll)
-
-# Optional / future research
-# DONE incorporate GAE into tree search to construct targets: difficulty: reanalyze --> needs restructuring of buffer to store episodes
-# TODO MCTS replay vs rollout buffer
-# TODO SAMPLED MUZERO: support for continuous action spaces
-
-
+"""AlphaZero reimplementation."""
 
 from absl import logging, app
 from functools import partial
@@ -74,7 +23,7 @@ import tensorflow_probability.substrates.jax.distributions as tfd # TODO: can be
 
 from envs import make_env, Transition, MCTSTransition, has_discrete_action_space, is_atari_env
 # from envs.brax_v1_wrappers import wrap_for_training
-from envs.brax_wrappers import EvalWrapper, wrap_for_training
+from envs.brax_wrappers import EvalWrapper, wrap_for_training, VmapWrapper
 from networks.policy import Policy, ForwardPass
 from networks.networks import FeedForwardNetwork, ActivationFn, make_policy_network, make_value_network, make_atari_feature_extractor
 from networks.distributions import NormalTanhDistribution, ParametricDistribution, PolicyNormalDistribution, DiscreteDistribution
@@ -84,9 +33,10 @@ from gymnax import gymnax
 from gymnax.gymnax.wrappers.brax import GymnaxToBraxWrapper, State
 import mctx_dist as mctx
 
+
 class Config:
     # experiment
-    experiment_name = 'ppo_test'
+    experiment_name = 'base_short'
     seed = 20
     platform = 'cpu' # CPU or GPU
     capture_video = False
@@ -95,13 +45,13 @@ class Config:
     save_scores = False
 
     # environment
-    env_id = 'CartPole-v1' # CartPole-v1, Breakout-MinAtar
+    env_id = 'Acrobot-v1' # CartPole-v1, Breakout-MinAtar, MountainCar-v0, Acrobot-v1
     num_envs = 16
     normalize_observations = True 
     action_repeat = 1
     eval_env = True
     num_resets_per_eval = 0
-    eval_every = 1
+    eval_every = 5
     deterministic_eval = True
     num_eval_envs = 64 
     episode_length = 500
@@ -109,11 +59,11 @@ class Config:
     # MCTS
     num_simulations = 30
     max_num_considered_actions = 16
-    l2_coef = 0 # 1e-4
+    l2_coef = 1e-4 # 1e-4
     vf_cost = 0.5
     use_gae = True
     gae_lambda = 0.95
-    n_step_gamma = 0.99
+    n_step_gamma = 0.99 # 0.99
     n_step_n = 5
 
     # quantile regression
@@ -125,7 +75,7 @@ class Config:
 
     # replay buffer
     min_replay_size: int = 8192
-    max_replay_size: Optional[int] = 4*8192 # 8192 # 16384
+    max_replay_size: Optional[int] = 8192 # 8192 # 16384
     replay_buffer_batch_size: int = 128 # 256
     per_alpha: float = 0.
     per_importance_sampling: bool = True
@@ -134,7 +84,7 @@ class Config:
     # algorithm hyperparameters
     total_timesteps = int(1e6) 
     learning_rate = 1e-3 # 3e-4 
-    unroll_length = 512 # 128 
+    unroll_length = 128 # 512 # 128 
     anneal_lr = True
     num_minibatches = 128 # 64
     update_epochs = 1 # NOTE: no reason to increase this, just increase sample size instead
@@ -336,6 +286,7 @@ def make_ppo_networks(
 
 def actor_step(
     env: GymnaxToBraxWrapper,
+    rollout_env: Any,
     env_state: State,
     forward: ForwardPass,
     key: jnp.ndarray,
@@ -366,7 +317,7 @@ def actor_step(
     def recurrent_fn(params, rng_key, action, embedding):
         # environment (model)
         env_state = embedding
-        nstate = env.step(env_state, action)
+        nstate = rollout_env.step(env_state, action)
 
         # policy & value networks
         prior_logits, value = forward(nstate.obs) # priorly: env_state
@@ -375,7 +326,9 @@ def actor_step(
         recurrent_fn_output = mctx.RecurrentFnOutput(
             reward=nstate.reward,
             # discount when terminal state reached
-            discount=1 - nstate.done,
+            discount= Config.n_step_gamma * jnp.where(
+                nstate.info['truncation'], jnp.ones_like(nstate.done), 1 - nstate.done
+            ), # 1 - nstate.done, 
             # prior for the new state
             prior_logits=prior_logits,
             # value for the new state
@@ -398,7 +351,7 @@ def actor_step(
     #         use_mixed_value=use_mixed_value),
     # )
 
-    policy_output = mctx.sampled_muzero_policy(
+    policy_output = mctx.sampled_muzero_policy( # muzero_policy
         params=(),
         rng_key=search_rng,
         root=root,
@@ -406,15 +359,17 @@ def actor_step(
         num_simulations=Config.num_simulations,
         dirichlet_fraction=0.25,
         dirichlet_alpha=0.3,
-        pb_c_init=1.25,
-        pb_c_base=19652,
+        pb_c_init=1.25,# 1.25,
+        pb_c_base=19652, # 19652,
         temperature=1.0,
     )
 
     actions = policy_output.action
     action_weights = policy_output.action_weights
     # best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
-    best_actions = jnp.argmax(jnp.mean(policy_output.search_tree.summary().qvalues, axis=-1), axis=-1).astype(jnp.int32)
+    qvalues = jnp.mean(policy_output.search_tree.summary().qvalues, axis=-1)
+    masked_qvalues = jnp.where(action_weights, qvalues, -jnp.inf)
+    best_actions = jnp.argmax(masked_qvalues, axis=-1).astype(jnp.int32)
     actions = jax.lax.select(deterministic_actions, best_actions, actions)
     
     search_value = policy_output.search_tree.summary().value
@@ -429,10 +384,11 @@ def actor_step(
     state_extras = {x: nstate.info[x] for x in extra_fields}
     return nstate, MCTSTransition(  # pytype: disable=wrong-arg-types  # jax-ndarray
         observation=env_state.obs,
+        real_obs=env_state.real_obs,
         action=actions,
         reward=nstate.reward,
         discount=1 - nstate.done,
-        next_observation=nstate.obs,
+        next_observation=nstate.real_obs, # nstate.obs
         target_policy_probs=action_weights,
         search_value=search_value,
         value_prefix_target=jnp.zeros_like(nstate.reward),
@@ -449,6 +405,7 @@ def actor_step(
 
 def generate_unroll(
     env: GymnaxToBraxWrapper,
+    rollout_env: Any,
     env_state: State,
     forward: ForwardPass,
     key: jnp.ndarray,
@@ -463,7 +420,7 @@ def generate_unroll(
         state, current_key = carry
         current_key, next_key = jax.random.split(current_key)
         nstate, transition = actor_step(
-            env, state, forward, current_key, 
+            env, rollout_env, state, forward, current_key, 
             deterministic_actions=deterministic_actions, 
             extra_fields=extra_fields)
         return (nstate, next_key), transition
@@ -477,6 +434,7 @@ class Evaluator:
     """Class to run evaluations."""
 
     def __init__(self, eval_env: GymnaxToBraxWrapper,
+                rollout_env: Any,
                 eval_forward_fn: Callable[[Any],
                                             Policy], num_eval_envs: int,
                 episode_length: int, action_repeat: int, key: jnp.ndarray,
@@ -503,6 +461,7 @@ class Evaluator:
             eval_first_state = eval_env.reset(reset_keys)
             return generate_unroll(
                 eval_env,
+                rollout_env,
                 eval_first_state,
                 eval_forward_fn(policy_params),
                 key,
@@ -552,6 +511,7 @@ class Evaluator:
 def reanalyze(data: MCTSTransition, 
               forward: ForwardPass,
               env: GymnaxToBraxWrapper,
+              rollout_env: Any,
               key: jnp.ndarray) -> MCTSTransition:
     data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (Config.num_minibatches, -1) 
                                                         + x.shape[1:]), data)
@@ -560,7 +520,7 @@ def reanalyze(data: MCTSTransition,
         new_key, key = jax.random.split(carry_key)
         # TODO: env_state currently not saved! needs to be saved or restored from other data!
         env_state = data.env_state
-        _, reanalyzed_data = actor_step(env, env_state, forward, key)
+        _, reanalyzed_data = actor_step(env, rollout_env, env_state, forward, key)
 
         return new_key, reanalyzed_data
         
@@ -821,18 +781,22 @@ def compute_muzero_loss(
 
     # Value function loss
     vs = jnp.expand_dims(data.value_prefix_target, -1) + jnp.expand_dims(data.bootstrap_discount, -1) * data.bootstrap_value
+    # vs = jnp.where(data.extras['state_extras']['truncation'], baseline, vs) # TODO Remove
 
     # NOTE TODO TEST TEST TEST
+    # values = value_apply(normalizer_params, params.value, data.real_obs)
     # bootstrap_value = value_apply(normalizer_params, params.value, data.next_observation[-1])
     # _, _, vs, _ = compute_gae(rewards=data.reward,
     #                           discounts=data.discount * (1 - data.extras['state_extras']['truncation']),
     #                           termination_discount=data.discount,
     #                           observations=data.next_observation,
-    #                           values=jnp.concatenate([baseline, jnp.expand_dims(bootstrap_value, 0)]),
+    #                           values=jnp.concatenate([values, jnp.expand_dims(bootstrap_value, 0)]),
+    #                           # gamma=0.9,
     #                           lambda_=0.95,
-    #                           discount=0.99
+    #                           discount=0.9,
     #                           )
     ##########################
+    # jax.debug.print('{values}', values=vs[:,0])
     v_losses = value_loss_fn(baseline, jax.lax.stop_gradient(vs))
     if per_importance_sampling:
         v_losses *= data.weight
@@ -941,6 +905,7 @@ def main(_):
         episode_length=Config.episode_length,
         action_repeat=Config.action_repeat,
     )
+    model_rollout_env = VmapWrapper(environment)
 
     reset_fn = jax.jit(jax.vmap(env.reset))
     key_envs = jax.random.split(key_envs, Config.num_envs // process_count)
@@ -960,6 +925,7 @@ def main(_):
     dummy_action = jnp.zeros((action_size,))
     dummy_transition = MCTSTransition(  # pytype: disable=wrong-arg-types  # jax-ndarray
         observation=dummy_obs,
+        real_obs=dummy_obs,
         action=0.,
         reward=0.,
         discount=0.,
@@ -1155,6 +1121,7 @@ def main(_):
 
         state, data = generate_unroll(
             env,
+            model_rollout_env,
             state,
             forward_fn,
             key_generate_unroll,
@@ -1164,7 +1131,7 @@ def main(_):
         
         # additional search at final step for bootstrap values
         _, transition = actor_step(
-            env, state, forward_fn, key_bootstrap, 
+            env, model_rollout_env, state, forward_fn, key_bootstrap, 
             deterministic_actions=False, 
             extra_fields=('truncation',))
         
@@ -1177,6 +1144,9 @@ def main(_):
             observations=data.next_observation,
             values=jnp.concatenate([data.search_value, jnp.array([transition.search_value])]),
         )
+        # value_prefix_targets = jnp.zeros_like(value_prefix_targets)
+        # bootstrap_discounts = jnp.ones_like(bootstrap_discounts)
+        # bootstrap_values = data.search_value
 
         # NOTE: data.bootstap_value is overloaded with the prior values
         targets = jnp.expand_dims(value_prefix_targets, -1) + jnp.expand_dims(bootstrap_discounts, -1) * bootstrap_values
@@ -1283,6 +1253,7 @@ def main(_):
 
         env_state, data = generate_unroll(
             env,
+            model_rollout_env,
             env_state,
             forward_fn,
             key_generate_unroll,
@@ -1359,6 +1330,7 @@ def main(_):
 
     evaluator = Evaluator(
         eval_env,
+        model_rollout_env,
         make_forward,
         num_eval_envs=Config.num_eval_envs,
         episode_length=Config.episode_length,
@@ -1405,7 +1377,7 @@ def main(_):
 
         #     def recurrent_fn(params, rng_key, action, embedding):
         #         env_state = embedding
-        #         nstate = eval_env.step(env_state, action)
+        #         nstate = model_rollout_env.step(env_state, action)
         #         prior_logits, value = plotting_forwad(env_state.obs)
 
         #         recurrent_fn_output = mctx.RecurrentFnOutput(
@@ -1523,11 +1495,9 @@ def main(_):
 
             # step_count = 0
             # while plotting_state.done[0] < 1 and plotting_state.info['truncation'][0] < 1:
-            #     print(step_count)
             #     search_rng, unroll_key = jax.random.split(unroll_key)
             
             #     prior_logits, value = plotting_forwad(plotting_state.obs)
-            #     print(value)
             #     use_mixed_value = False
             #     root = mctx.RootFnOutput(
             #         prior_logits=prior_logits,
@@ -1537,32 +1507,50 @@ def main(_):
 
             #     def recurrent_fn(params, rng_key, action, embedding):
             #         env_state = embedding
-            #         nstate = eval_env.step(env_state, action)
-            #         prior_logits, value = plotting_forwad(env_state.obs)
+            #         nstate = model_rollout_env.step(env_state, action)
+            #         prior_logits, value = plotting_forwad(nstate.obs)
 
             #         recurrent_fn_output = mctx.RecurrentFnOutput(
             #             reward=nstate.reward,
-            #             discount=1 - nstate.done,
+            #             discount=Config.n_step_gamma * jnp.where(
+            #                 nstate.info['truncation'], jnp.ones_like(nstate.done), 1 - nstate.done
+            #             ), #1 - nstate.done,
             #             prior_logits=prior_logits,
             #             value=value,
             #         )
             #         return recurrent_fn_output, nstate
 
-            #     policy_output = mctx.gumbel_muzero_policy(
+            #     # policy_output = mctx.gumbel_muzero_policy(
+            #     #     params=(),
+            #     #     rng_key=search_rng,
+            #     #     root=root,
+            #     #     recurrent_fn=recurrent_fn,
+            #     #     num_simulations=Config.num_simulations,
+            #     #     max_num_considered_actions=Config.max_num_considered_actions,
+            #     #     qtransform=partial(
+            #     #         mctx.qtransform_completed_by_mix_value,
+            #     #         use_mixed_value=use_mixed_value),
+            #     # )
+
+            #     policy_output = mctx.sampled_muzero_policy(
             #         params=(),
             #         rng_key=search_rng,
             #         root=root,
             #         recurrent_fn=recurrent_fn,
             #         num_simulations=Config.num_simulations,
-            #         max_num_considered_actions=Config.max_num_considered_actions,
-            #         qtransform=partial(
-            #             mctx.qtransform_completed_by_mix_value,
-            #             use_mixed_value=use_mixed_value),
+            #         dirichlet_fraction=0.25,
+            #         dirichlet_alpha=0.3,
+            #         pb_c_init=1.25,# 1.25,
+            #         pb_c_base=19652, #19652,
+            #         temperature=1.0,
             #     )
+
+            #     print_done = (1 - plotting_state.done[0]) * (1 - plotting_state.info['truncation'][0])
+            #     # print(step_count, value[0], policy_output.search_tree.summary().value[0], print_done)
 
             #     actions = policy_output.action
             #     action_weights = policy_output.action_weights
-            #     best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
+            #     best_actions = jnp.argmax(jnp.mean(policy_output.search_tree.summary().qvalues, axis=-1), axis=-1).astype(jnp.int32)
             #     actions = jax.lax.select(deterministic_actions, best_actions, actions)
                 
             #     mctx.draw_tree_to_file(policy_output.search_tree, f'plots/search_tree_{it}_{step_count}.png')

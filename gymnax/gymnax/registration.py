@@ -1,7 +1,8 @@
 from .environments import (
+    Acrobot,
     # Pendulum,
     CartPole,
-    # MountainCar,
+    MountainCar,
     # DeepSea,
     # MinAsterix,
     MinBreakout,
@@ -9,6 +10,7 @@ from .environments import (
     # MinSeaquest,
     # MinSpaceInvaders,
     # Pong,
+    ProcMaze,
 )
 
 # =============================================================================
@@ -30,6 +32,10 @@ def make(env_id: str, **env_kwargs):
         env = ContinuousMountainCar(**env_kwargs)
     elif env_id == "Acrobot-v1":
         env = Acrobot(**env_kwargs)
+
+    # Custom
+    elif env_id == "ProcMaze":
+        env = ProcMaze(**env_kwargs)
 
     # 2. DeepMind's bsuite environments
     elif env_id == "Catch-bsuite":

@@ -7,6 +7,7 @@ NestedArray = jnp.ndarray
 class Transition(NamedTuple):
     """Container for a transition."""
     observation: NestedArray
+    real_obs: NestedArray
     action: NestedArray
     reward: NestedArray
     discount: NestedArray
@@ -17,6 +18,7 @@ class Transition(NamedTuple):
 class MCTSTransition(NamedTuple):
     """Container for a transition."""
     observation: NestedArray
+    real_obs: NestedArray
     action: NestedArray
     reward: NestedArray
     discount: NestedArray

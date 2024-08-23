@@ -2,9 +2,9 @@ from .environment import EnvParams, EnvState
 from .classic_control import (
     # Pendulum,
     CartPole,
-    # MountainCar,
+    MountainCar,
     # ContinuousMountainCar,
-    # Acrobot,
+    Acrobot,
 )
 
 from .minatar import (
@@ -13,6 +13,10 @@ from .minatar import (
     MinFreeway,
     MinSeaquest,
     MinSpaceInvaders,
+)
+
+from .custom import (
+    ProcMaze
 )
 
 # from .misc import (
@@ -55,4 +59,5 @@ __all__ = [
     "Reacher",
     "Swimmer",
     "Pong",
+    "ProcMaze",
 ]

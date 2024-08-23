@@ -19,6 +19,7 @@ class State:  # Lookalike for brax.envs.env.State
     obs: jax.Array # Any  # depends on environment
     reward: jax.Array # float
     done: jax.Array # bool
+    real_obs: jax.Array # observation prior to resetting
     metrics: Dict[str, Union[chex.Array, chex.Scalar]] = field(default_factory=dict)
     info: Dict[str, Any] = field(default_factory=dict)
 
@@ -47,6 +48,7 @@ class GymnaxToBraxWrapper(Env):
             obs,
             0., # jnp.zeros(1)
             0., # jnp.zeros(1)
+            obs,
             {},
             {"_rng": jax.random.split(rng)[0], "_env_params": params,
              'truncation': jnp.zeros(rng.shape[:-1])},
@@ -65,7 +67,7 @@ class GymnaxToBraxWrapper(Env):
         state.info.update(_rng=rng, _env_params=params)
         o, env_state, r, terminated, info = self.env.step(step_rng, state.pipeline_state, action, params)
         state.info['truncation'] = info['truncation']
-        return state.replace(pipeline_state=env_state, obs=o, reward=r, done=terminated)
+        return state.replace(pipeline_state=env_state, obs=o, reward=r, done=terminated, real_obs=o)
 
     def action_size(self) -> int:
         """DEFAULT size of action vector expected by step. Can't pass params to property"""

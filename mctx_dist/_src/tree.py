@@ -178,6 +178,7 @@ def draw_tree_to_file(
             f"Reward: {reward:.2f}\n"
             f"Discount: {discount:.2f}\n"
             f"Value: {jnp.mean(tree.node_values[batch_index, node_i], axis=-1):.2f}\n" 
+            f"Value Prior: {jnp.mean(tree.raw_values[batch_index, node_i], axis=-1):.2f}\n"
             f"Visits: {tree.node_visits[batch_index, node_i]}\n")
 
   def edge_to_str(node_i, a_i):

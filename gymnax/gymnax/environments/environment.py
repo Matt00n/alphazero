@@ -39,13 +39,13 @@ class Environment(object):
         obs_st, state_st, reward, done, info = self.step_env(
             key, state, action, params
         )
-        obs_re, state_re = self.reset_env(key_reset, params)
-        # Auto-reset environment based on termination
-        state = jax.tree_map(
-            lambda x, y: jax.lax.select(done.astype(bool), x, y), state_re, state_st
-        )
-        obs = jax.lax.select(done.astype(bool), obs_re, obs_st)
-        return obs, state, reward, done, info
+        # obs_re, state_re = self.reset_env(key_reset, params)
+        # # Auto-reset environment based on termination
+        # state = jax.tree_map(
+        #     lambda x, y: jax.lax.select(done.astype(bool), x, y), state_re, state_st
+        # )
+        # obs = jax.lax.select(done.astype(bool), obs_re, obs_st)
+        return obs_st, state_st, reward, done, info
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(

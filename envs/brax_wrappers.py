@@ -120,11 +120,18 @@ class AutoResetWrapper(Wrapper):
                 done = jp.reshape(done, [x.shape[0]] + [1] * (len(x.shape) - 1))  # type: ignore
             return jp.where(done, x, y)
 
-        pipeline_state = jax.tree_map(
-            where_done, state.info['first_pipeline_state'], state.pipeline_state
+        # pipeline_state = jax.tree_map(
+        #     where_done, state.info['first_pipeline_state'], state.pipeline_state
+        # )
+        # obs = where_done(state.info['first_obs'], state.obs)
+
+        state_re = self.reset(state.info["_rng"])
+        # Auto-reset environment based on termination
+        pipeline_new = jax.tree_map(
+            where_done, state_re.pipeline_state, state.pipeline_state
         )
-        obs = where_done(state.info['first_obs'], state.obs)
-        return state.replace(pipeline_state=pipeline_state, obs=obs)
+        obs_new = where_done(state_re.obs, state.obs)
+        return state.replace(pipeline_state=pipeline_new, obs=obs_new)
 
 
 @struct.dataclass

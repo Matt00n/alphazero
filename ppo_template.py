@@ -57,7 +57,7 @@ class Config:
     save_scores = False
 
     # environment
-    env_id = 'CartPole-v1' # CartPole-v1, Breakout-MinAtar
+    env_id = 'Acrobot-v1' # CartPole-v1, Breakout-MinAtar, MountainCar-v0, Acrobot-v1
     num_envs = 16
     normalize_observations = True 
     action_repeat = 1
@@ -73,7 +73,7 @@ class Config:
     learning_rate = 1e-3 # 3e-4 
     unroll_length = 128 
     anneal_lr = True
-    gamma = 0.99 
+    gamma = 0.99
     gae_lambda = 0.95
     batch_size = 8 # number of unrolls per minibatch 
     num_minibatches = 8
@@ -277,10 +277,11 @@ def actor_step(
     state_extras = {x: nstate.info[x] for x in extra_fields}
     return nstate, Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
         observation=env_state.obs,
+        real_obs=env_state.real_obs,
         action=actions,
         reward=nstate.reward,
         discount=1 - nstate.done,
-        next_observation=nstate.obs,
+        next_observation=nstate.real_obs, # nstate.obs
         extras={
             'policy_extras': policy_extras,
             'state_extras': state_extras
@@ -387,6 +388,7 @@ def compute_gae(truncation: jnp.ndarray,
                 termination: jnp.ndarray,
                 rewards: jnp.ndarray,
                 values: jnp.ndarray,
+                bootstrap_values: jnp.ndarray,
                 bootstrap_value: jnp.ndarray,
                 lambda_: float = 1.0,
                 discount: float = 0.99):
@@ -414,7 +416,8 @@ def compute_gae(truncation: jnp.ndarray,
     truncation_mask = 1 - truncation
     # Append bootstrapped value to get [v1, ..., v_t+1]
     values_t_plus_1 = jnp.concatenate(
-        [values[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0)
+        [bootstrap_values[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0) # values
+    # values_t_plus_1 = bootstrap_value
     deltas = rewards + discount * (1 - termination) * values_t_plus_1 - values
     deltas *= truncation_mask
 
@@ -493,18 +496,23 @@ def compute_ppo_loss(
     data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
 
     hidden = data.observation
+    hidden_not_reset = data.real_obs
     hidden_boot = data.next_observation[-1]
+    # hidden_boot = data.next_observation
     if shared_feature_extractor:
         feature_extractor_apply = ppo_network.feature_extractor.apply
         hidden = feature_extractor_apply(normalizer_params, params.feature_extractor, data.observation)
+        hidden_not_reset = feature_extractor_apply(normalizer_params, params.feature_extractor, data.real_obs)
         hidden_boot = feature_extractor_apply(normalizer_params, params.feature_extractor, 
                                           data.next_observation[-1])
+        hidden_boot = feature_extractor_apply(normalizer_params, params.feature_extractor, 
+                                          data.next_observation)
     
     policy_logits = policy_apply(normalizer_params, params.policy,
                                 hidden)
 
     baseline = jnp.squeeze(value_apply(normalizer_params, params.value, hidden))
-
+    bootstrap_values = jnp.squeeze(value_apply(normalizer_params, params.value, hidden_not_reset))
     
     bootstrap_value = jnp.squeeze(value_apply(normalizer_params, params.value,
                                     hidden_boot))
@@ -522,6 +530,7 @@ def compute_ppo_loss(
         termination=termination,
         rewards=rewards,
         values=baseline,
+        bootstrap_values=bootstrap_values,
         bootstrap_value=bootstrap_value,
         lambda_=gae_lambda,
         discount=discounting)
@@ -529,6 +538,7 @@ def compute_ppo_loss(
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     log_ratio = target_action_log_probs - behaviour_action_log_probs
     rho_s = jnp.exp(log_ratio)
+    # jax.debug.print('{values}', values=vs[:,0])
 
     surrogate_loss1 = rho_s * advantages
     surrogate_loss2 = jnp.clip(rho_s, 1 - clipping_epsilon,

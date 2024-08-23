@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax import lax
-from gymnax.environments import environment, spaces
+from gymnax.gymnax.environments import environment, spaces
 from typing import Tuple, Optional
 import chex
 from flax import struct
@@ -30,7 +30,7 @@ class EnvParams:
     max_vel_1: float = 4 * jnp.pi
     max_vel_2: float = 9 * jnp.pi
     torque_noise_max: float = 0.0
-    max_steps_in_episode: int = 500
+    max_steps_in_episode: int = 5000
 
 
 class Acrobot(environment.Environment):
@@ -95,13 +95,14 @@ class Acrobot(environment.Environment):
             velocity_2,
             state.time + 1,
         )
-        done = self.is_terminal(state, params)
+        done, truncated = self.is_terminal(state, params)
         return (
             lax.stop_gradient(self.get_obs(state)),
             lax.stop_gradient(state),
             reward,
             done,
-            {"discount": self.discount(state, params)},
+            {"discount": self.discount(state, params),
+             "truncation": truncated},
         )
 
     def reset_env(
@@ -136,15 +137,14 @@ class Acrobot(environment.Environment):
     def is_terminal(self, state: EnvState, params: EnvParams) -> bool:
         """Check whether state is terminal."""
         # Check termination and construct updated state
-        done_angle = (
+        done = jnp.array(
             -jnp.cos(state.joint_angle1)
             - jnp.cos(state.joint_angle2 + state.joint_angle1)
             > 1.0
-        )
+        ).astype(float)
         # Check number of steps in episode termination condition
-        done_steps = state.time >= params.max_steps_in_episode
-        done = jnp.logical_or(done_angle, done_steps)
-        return done
+        truncated = jnp.array(state.time >= params.max_steps_in_episode).astype(float)
+        return done, truncated
 
     @property
     def name(self) -> str:

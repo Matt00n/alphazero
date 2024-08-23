@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax import lax
-from gymnax.environments import environment, spaces
+from gymnax.gymnax.environments import environment, spaces
 from typing import Tuple, Optional
 import chex
 from flax import struct
@@ -23,7 +23,7 @@ class EnvParams:
     goal_velocity: float = 0.0
     force: float = 0.001
     gravity: float = 0.0025
-    max_steps_in_episode: int = 200
+    max_steps_in_episode: int = 5000
 
 
 class MountainCar(environment.Environment):
@@ -60,14 +60,15 @@ class MountainCar(environment.Environment):
 
         # Update state dict and evaluate termination conditions
         state = EnvState(position, velocity, state.time + 1)
-        done = self.is_terminal(state, params)
+        done, truncated = self.is_terminal(state, params)
 
         return (
             lax.stop_gradient(self.get_obs(state)),
             lax.stop_gradient(state),
             reward,
             done,
-            {"discount": self.discount(state, params)},
+            {"discount": self.discount(state, params),
+             "truncation": truncated},
         )
 
     def reset_env(
@@ -82,16 +83,15 @@ class MountainCar(environment.Environment):
         """Return observation from raw state trafo."""
         return jnp.array([state.position, state.velocity])
 
-    def is_terminal(self, state: EnvState, params: EnvParams) -> bool:
+    def is_terminal(self, state: EnvState, params: EnvParams) -> Tuple[bool, bool]:
         """Check whether state is terminal."""
-        done1 = (state.position >= params.goal_position) * (
+        done = jnp.array((state.position >= params.goal_position) * (
             state.velocity >= params.goal_velocity
-        )
+        )).astype(float)
 
         # Check number of steps in episode termination condition
-        done_steps = state.time >= params.max_steps_in_episode
-        done = jnp.logical_or(done1, done_steps)
-        return done
+        truncated = jnp.array(state.time >= params.max_steps_in_episode).astype(float)
+        return done, truncated
 
     @property
     def name(self) -> str:
