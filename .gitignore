@@ -5,3 +5,7 @@ training_logs/
 experiments/
 plots/
 test_implementations/
+*.ipynb
+muzero_no_replay.py
+ppo_template.py
+plan.md

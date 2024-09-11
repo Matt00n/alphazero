@@ -1,40 +1,26 @@
-# Development Progress / change log
+# AlphaZero Reimplementation
 
-[x] Compatibility with Jax environment
-[x] Port to Gymnax (convert Gymnax API to Brax (done), modify gymnax to return truncated flags (done), env returns only jax arrays (done))
-[x] Ensure that scores are maintained 
-[x] dissolve all dependency issues in subfiles
-[ ] visualizer
-[x] Blueprint of all Muzero elements
-[x] Adapt policy learning
-[x] Replay Buffers from Brax (logic for prefilling buffer before training)
-[x] keep options for both replay & rollout buffer --> test to see what works better in target use case (Temp solution: Comment out sampling from buffer in training_step)
-[x] Auto reset not wanted in MCTS rollouts
-[x] Fix handling of truncation
-[x] Option for GAE to construct value network targets (difficulty: reanalyze --> needs restructuring of buffer to store episodes)
-[ ] look into running jax on (M1) GPU: Gymnax, Jax docs, Jax metal
-[ ] clean up and organize code / folders
-[x] Test with Gymnax environments
-[ ] option for different MCTS versions from MCTX
-[ ] pass in mcts policy as argument so that we can partial it before
-[x] make eval deterministic (as option) 
+This is a reimplementation of the infamous [AlphaZero](https://arxiv.org/abs/1712.01815) algorithm in JAX. At its core, we use [MCTX](https://github.com/google-deepmind/mctx) for the tree search. The system design is inspired by [BRAX](https://github.com/google/brax).
 
-## Adapt implementation details from further papers: EfficientZero, Reanalyze, Sampled Muzero, Gumble Muzero, AlphaTensor, AlphaDev, DreamerV3
+### Main features
 
-[x] Prioritized replay buffer (see https://github.com/werner-duvaud/muzero-general/tree/master and https://github.com/YeWR/EfficientZero/blob/main/core/replay_buffer.py)
-[x] Categorical value function (QR from AlphaTensor instead of MuZeros version)
-[x] n-step value targets
-[ ] option for learning dynamics model
-# NOTE: Muzero samples trajectories during training: unrolls model in parallel to true trajectory and then computes loss for every step. We do not do this since we do not train a model anyway --> apply policy / value to true observation instead of its representation.
-[ ] MUZERO REANALYZE: option for reanalyzing data in buffer
-[ ] MUZERO REANALYZE: target network (for value), which is updated infrequently
-[ ] MUZERO REANALYZE: reanalyze highest reward states (exploit rare events)
-[x] SAMPLED MUZERO: sampling of actions / main algorithm
-[ ] SAMPLED MUZERO: support for continuous action spaces
-[x] ALPHATENSOR: quantile regression distributional loss for value function
-[ ] ALPHATENSOR: option for implicit quantile networks (IQN) distributional loss for value function
-[ ] ALPHATENSOR: sub-tree persistence --> subtree of selected action is reused in next search
-[ ] ALPHATENSOR: bootstrapping during search not with mean value but risk-seeking value (average of quantiles above 75%) (since deterministic env and only interested in best action) (ALSO SEE https://github.com/bwfbowen/muax/tree/main/muax and https://github.com/werner-duvaud/muzero-general/blob/master/models.py for example)
+* Performance on par with the original AlphaZero on common RL environments.
+* Fast training and tree search via [JAX](https://jax.readthedocs.io/en/latest/) and [MCTX](https://github.com/google-deepmind/mctx).
+* Prioritized replay buffer.
+* Support for sample-based versions of AlphaZero as in [Sampled MuZero](https://arxiv.org/abs/2104.06303). The different variants of AlphaZero (standard, sampled, Gumbel) can easily be switched in.
+* Option for using a distributional value function via [Quantile Regression](https://arxiv.org/abs/1710.10044) similarly as in [AlphaTensor](https://www.nature.com/articles/s41586-022-05172-4).
+* Option for using [GAE (Generalized Advantage Estimation)](https://arxiv.org/abs/1506.02438) instead of n-step returns.
+* Environment support for [gymnax](https://github.com/RobertTLange/gymnax). Minimal modification of the environments is required, this has been done for CartPole, MountainCar and Acrobot so far. Other common JAX environment libraries can also be plugged in with small adaptations.
+* Option for [REANALYZE](https://arxiv.org/abs/2104.06294). *This is work in progress and not fully implemented yet!*.
+
+### Potential future extensions (if I have time...)
+
+* Extension to [MuZero](https://arxiv.org/abs/1911.08265) by learning dynamics model.
+* Finishing REANALYZE.
+* Enable choosing MCTS version (standard, sampled, Gumbel, stochastic) via Config (has to be manually changed currently).
+* Support for continuous action spaces
+
+
 
 
 

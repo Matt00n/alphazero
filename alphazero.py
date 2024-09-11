@@ -119,21 +119,21 @@ def _strip_weak_type(tree):
 
 
 @flax.struct.dataclass
-class PPONetworkParams:
+class AZNetworkParams:
     """Contains training state for the learner."""
     policy: Any
     value: Any
 
 
 @flax.struct.dataclass
-class PPONetworks:
+class AZNetworks:
     policy_network: FeedForwardNetwork
     value_network: FeedForwardNetwork
     parametric_action_distribution: Union[ParametricDistribution, DiscreteDistribution]
 
 
 @flax.struct.dataclass
-class AtariPPONetworkParams:
+class AtariAZNetworkParams:
     """Contains training state for the learner."""
     feature_extractor: Any
     policy: Any
@@ -141,7 +141,7 @@ class AtariPPONetworkParams:
 
 
 @flax.struct.dataclass
-class AtariPPONetworks:
+class AtariAZNetworks:
     feature_extractor: FeedForwardNetwork
     policy_network: FeedForwardNetwork
     value_network: FeedForwardNetwork
@@ -152,22 +152,22 @@ class AtariPPONetworks:
 class TrainingState:
     """Contains training state for the learner."""
     optimizer_state: optax.OptState
-    params: Union[PPONetworkParams, AtariPPONetworkParams]
+    params: Union[AZNetworkParams, AtariAZNetworkParams]
     normalizer_params: running_statistics.RunningStatisticsState
     env_steps: jnp.ndarray
 
 
-def make_inference_fn(ppo_networks: Union[PPONetworks, AtariPPONetworks]):
-    """Creates params and inference function for the PPO agent."""
+def make_inference_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
+    """Creates params and inference function for the agent."""
 
     def make_policy(params: Any,
                     deterministic: bool = False,
                     use_feature_extractor: bool = False,
                     ) -> Policy:
-        policy_network = ppo_networks.policy_network
-        parametric_action_distribution = ppo_networks.parametric_action_distribution
+        policy_network = az_networks.policy_network
+        parametric_action_distribution = az_networks.parametric_action_distribution
         if use_feature_extractor:
-            shared_feature_extractor = ppo_networks.feature_extractor
+            shared_feature_extractor = az_networks.feature_extractor
         normalizer_params, policy_params, feature_extractor_params = params
 
         @jax.jit # TODO jit needed ?
@@ -177,7 +177,7 @@ def make_inference_fn(ppo_networks: Union[PPONetworks, AtariPPONetworks]):
                 observations = shared_feature_extractor.apply(normalizer_params, feature_extractor_params, observations)
             logits = policy_network.apply(normalizer_params, policy_params, observations)
             if deterministic:
-                return ppo_networks.parametric_action_distribution.mode(logits), {}
+                return az_networks.parametric_action_distribution.mode(logits), {}
             raw_actions = parametric_action_distribution.sample_no_postprocessing(
                 logits, key_sample)
             log_prob = parametric_action_distribution.log_prob(logits, raw_actions)
@@ -193,16 +193,16 @@ def make_inference_fn(ppo_networks: Union[PPONetworks, AtariPPONetworks]):
     return make_policy
 
 
-def make_forward_fn(ppo_networks: Union[PPONetworks, AtariPPONetworks]):
-    """Creates params and inference function for the PPO agent."""
+def make_forward_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
+    """Creates params and inference function for the agent."""
 
     def make_forward(params: Any,
                     use_feature_extractor: bool = False,
                     ) -> ForwardPass:
-        policy_network = ppo_networks.policy_network
-        value_network = ppo_networks.value_network
+        policy_network = az_networks.policy_network
+        value_network = az_networks.value_network
         if use_feature_extractor:
-            shared_feature_extractor = ppo_networks.feature_extractor
+            shared_feature_extractor = az_networks.feature_extractor
         normalizer_params, policy_params, value_params, feature_extractor_params = params
 
         @jax.jit # TODO jit needed ?
@@ -220,7 +220,7 @@ def make_forward_fn(ppo_networks: Union[PPONetworks, AtariPPONetworks]):
     return make_forward
 
 
-def make_ppo_networks(
+def make_az_networks(
         observation_size: Union[Sequence[int], int],
         action_size: int,
         num_atoms: int,
@@ -232,8 +232,8 @@ def make_ppo_networks(
         discrete_policy: bool = False,
         shared_feature_extractor: bool = False,
         feature_extractor_dense_hidden_layer_sizes: Optional[Sequence[int]] = (512,),
-    ) -> Union[PPONetworks, AtariPPONetworkParams]:
-    """Make PPO networks with preprocessor."""
+    ) -> Union[AZNetworks, AtariAZNetworkParams]:
+    """Make networks with preprocessor."""
     if discrete_policy:
         parametric_action_distribution = DiscreteDistribution(
             param_size=action_size)
@@ -260,7 +260,7 @@ def make_ppo_networks(
             num_atoms=num_atoms,
             hidden_layer_sizes=(),
             activation=activation)
-        return AtariPPONetworks(
+        return AtariAZNetworks(
             feature_extractor=feature_extractor,
             policy_network=policy_network,
             value_network=value_network,
@@ -278,7 +278,7 @@ def make_ppo_networks(
         hidden_layer_sizes=value_hidden_layer_sizes,
         activation=activation)
 
-    return PPONetworks(
+    return AZNetworks(
         policy_network=policy_network,
         value_network=value_network,
         parametric_action_distribution=parametric_action_distribution)
@@ -721,11 +721,11 @@ def mse_value_loss(values: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
 
 
 def compute_muzero_loss(
-    params: Union[PPONetworkParams, AtariPPONetworkParams],
+    params: Union[AZNetworkParams, AtariAZNetworkParams],
     normalizer_params: Any,
     data: MCTSTransition,
     rng: jnp.ndarray,
-    ppo_network: Union[PPONetworks, AtariPPONetworks],
+    az_network: Union[AZNetworks, AtariAZNetworks],
     value_loss_fn: Callable[[Any], jnp.ndarray],
     vf_cost: float = 0.5,
     l2_coef: float = 1e-4,
@@ -741,7 +741,7 @@ def compute_muzero_loss(
             are ['state_extras']['truncation'] ['policy_extras']['raw_action']
             ['policy_extras']['log_prob']
         rng: Random key
-        ppo_network: PPO networks.
+        az_network: networks.
         vf_cost: Value loss coefficient.
         l2_coef: L2 penalty coefficient.
         shared_feature_extractor: Whether networks use a shared feature extractor.
@@ -749,17 +749,17 @@ def compute_muzero_loss(
     Returns:
         A tuple (loss, metrics)
     """
-    parametric_action_distribution = ppo_network.parametric_action_distribution
+    parametric_action_distribution = az_network.parametric_action_distribution
     
-    policy_apply = ppo_network.policy_network.apply
-    value_apply = ppo_network.value_network.apply
+    policy_apply = az_network.policy_network.apply
+    value_apply = az_network.value_network.apply
 
     # Put the time dimension first.
     # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
 
     hidden = data.observation
     if shared_feature_extractor:
-        feature_extractor_apply = ppo_network.feature_extractor.apply
+        feature_extractor_apply = az_network.feature_extractor.apply
         hidden = feature_extractor_apply(normalizer_params, params.feature_extractor, data.observation)
     
     policy_logits = policy_apply(normalizer_params, params.policy,
@@ -781,22 +781,6 @@ def compute_muzero_loss(
 
     # Value function loss
     vs = jnp.expand_dims(data.value_prefix_target, -1) + jnp.expand_dims(data.bootstrap_discount, -1) * data.bootstrap_value
-    # vs = jnp.where(data.extras['state_extras']['truncation'], baseline, vs) # TODO Remove
-
-    # NOTE TODO TEST TEST TEST
-    # values = value_apply(normalizer_params, params.value, data.real_obs)
-    # bootstrap_value = value_apply(normalizer_params, params.value, data.next_observation[-1])
-    # _, _, vs, _ = compute_gae(rewards=data.reward,
-    #                           discounts=data.discount * (1 - data.extras['state_extras']['truncation']),
-    #                           termination_discount=data.discount,
-    #                           observations=data.next_observation,
-    #                           values=jnp.concatenate([values, jnp.expand_dims(bootstrap_value, 0)]),
-    #                           # gamma=0.9,
-    #                           lambda_=0.95,
-    #                           discount=0.9,
-    #                           )
-    ##########################
-    # jax.debug.print('{values}', values=vs[:,0])
     v_losses = value_loss_fn(baseline, jax.lax.stop_gradient(vs))
     if per_importance_sampling:
         v_losses *= data.weight
@@ -824,8 +808,6 @@ def compute_muzero_loss(
 
 
 
-
-
 def main(_):
     start_time = time.time()
 
@@ -834,7 +816,7 @@ def main(_):
     if Config.write_logs_to_file:
         from absl import flags
         flags.FLAGS.alsologtostderr = True
-        log_path = f'./training_logs/ppo/{run_name}'
+        log_path = f'./training_logs/az/{run_name}'
         if not os.path.exists(log_path):
             os.makedirs(log_path)
         logging.get_absl_handler().use_absl_log_file('logs', log_path)
@@ -966,7 +948,7 @@ def main(_):
     if Config.normalize_observations:
         normalize = running_statistics.normalize
 
-    ppo_network = make_ppo_networks(
+    az_network = make_az_networks(
         observation_size=observation_shape, # NOTE only works with flattened observation space
         action_size=action_size, # flatten action size for nested spaces
         num_atoms=Config.num_atoms,
@@ -979,7 +961,7 @@ def main(_):
         shared_feature_extractor=is_atari,
         feature_extractor_dense_hidden_layer_sizes=Config.atari_dense_layer_sizes,
     )
-    make_forward = make_forward_fn(ppo_network)
+    make_forward = make_forward_fn(az_network)
     make_forward = partial(make_forward, use_feature_extractor=is_atari)
 
     # create optimizer
@@ -1020,7 +1002,7 @@ def main(_):
     # create loss function via functools.partial
     loss_fn = partial(
         compute_muzero_loss,
-        ppo_network=ppo_network,
+        az_network=az_network,
         value_loss_fn=value_loss_fn,
         vf_cost=Config.vf_cost,
         l2_coef=Config.l2_coef,
@@ -1294,19 +1276,19 @@ def main(_):
 
     # initialize params & training state
     if is_atari:
-        init_params = AtariPPONetworkParams(
-            feature_extractor=ppo_network.feature_extractor.init(key_feature_extractor),
-            policy=ppo_network.policy_network.init(key_policy),
-            value=ppo_network.value_network.init(key_value))
+        init_params = AtariAZNetworkParams(
+            feature_extractor=az_network.feature_extractor.init(key_feature_extractor),
+            policy=az_network.policy_network.init(key_policy),
+            value=az_network.value_network.init(key_value))
     else:
-        init_params = AtariPPONetworkParams(
+        init_params = AtariAZNetworkParams(
             feature_extractor=jnp.zeros(1),
-            policy=ppo_network.policy_network.init(key_policy),
-            value=ppo_network.value_network.init(key_value))
+            policy=az_network.policy_network.init(key_policy),
+            value=az_network.value_network.init(key_value))
     # else:
-    #     init_params = PPONetworkParams(
-    #         policy=ppo_network.policy_network.init(key_policy),
-    #         value=ppo_network.value_network.init(key_value))
+    #     init_params = AZNetworkParams(
+    #         policy=az_network.policy_network.init(key_policy),
+    #         value=az_network.value_network.init(key_value))
     training_state = TrainingState(  # pytype: disable=wrong-arg-types  # jax-ndarray
         optimizer_state=optimizer.init(init_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
         params=init_params,
