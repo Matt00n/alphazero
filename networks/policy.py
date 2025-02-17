@@ -24,6 +24,25 @@ class ForwardPass(Protocol):
       observation: jnp.ndarray,
   ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     pass
+
+
+class BaseRepresentationFn(Protocol):
+
+  def __call__(
+      self,
+      observation: jnp.ndarray,
+  ) -> jnp.ndarray:
+    pass
+
+
+class BaseDynamicsFn(Protocol):
+
+  def __call__(
+      self,
+      hidden_state: jnp.ndarray,
+      action: jnp.ndarray,
+  ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    pass
   
 
 class NetworkFactory(Protocol[NetworkType]):
