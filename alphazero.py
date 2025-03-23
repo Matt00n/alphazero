@@ -1226,7 +1226,7 @@ def main(_):
         buffer_state: ReplayBufferState, key: jnp.ndarray
     ) -> Tuple[TrainingState, State, ReplayBufferState, jnp.ndarray]:
 
-        key_generate_unroll, new_key = jax.random.split(key)
+        key_generate_unroll, key_bootstrap, new_key = jax.random.split(key, 3)
 
         forward_fn = make_forward(
             (training_state.normalizer_params, training_state.params.policy, 
@@ -1243,6 +1243,32 @@ def main(_):
             deterministic_actions=False,
             extra_fields=('truncation',)
         )
+
+        # additional search at final step for bootstrap values
+        _, transition = actor_step(
+            env, model_rollout_env, env_state, forward_fn, key_bootstrap, 
+            deterministic_actions=False, 
+            extra_fields=('truncation',))
+        
+        assert data.discount.shape[0] == Config.unroll_length
+
+        value_prefix_targets, bootstrap_observations, bootstrap_values, bootstrap_discounts = n_step_fn(
+            rewards=data.reward,
+            discounts=data.discount * (1 - data.extras['state_extras']['truncation']),
+            termination_discount=data.discount,
+            observations=data.next_observation,
+            values=jnp.concatenate([data.search_value, jnp.array([transition.search_value])]),
+        )
+        # value_prefix_targets = jnp.zeros_like(value_prefix_targets)
+        # bootstrap_discounts = jnp.ones_like(bootstrap_discounts)
+        # bootstrap_values = data.search_value
+
+        # NOTE: data.bootstap_value is overloaded with the prior values
+        targets = jnp.expand_dims(value_prefix_targets, -1) + jnp.expand_dims(bootstrap_discounts, -1) * bootstrap_values
+        priorities = (jnp.mean(jnp.abs(targets - data.bootstrap_value), axis=-1) + 1e-10)**Config.per_alpha
+
+        data = data._replace(value_prefix_target=value_prefix_targets, bootstrap_observation=bootstrap_observations,
+                      bootstrap_value=bootstrap_values, bootstrap_discount=bootstrap_discounts, priority=priorities)
 
         # Have leading dimensions (batch_size * num_minibatches, unroll_length)
         # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
