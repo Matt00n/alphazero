@@ -1250,7 +1250,7 @@ def main(_):
             deterministic_actions=False, 
             extra_fields=('truncation',))
         
-        assert data.discount.shape[0] == Config.unroll_length
+        assert data.discount.shape[0] == num_prefill_actor_steps
 
         value_prefix_targets, bootstrap_observations, bootstrap_values, bootstrap_discounts = n_step_fn(
             rewards=data.reward,
