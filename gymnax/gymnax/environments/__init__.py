@@ -5,6 +5,7 @@ from .classic_control import (
     MountainCar,
     # ContinuousMountainCar,
     Acrobot,
+    AcrobotNoTerm,
 )
 
 from .minatar import (
@@ -39,6 +40,7 @@ __all__ = [
     "MountainCar",
     "ContinuousMountainCar",
     "Acrobot",
+    "AcrobotNoTerm",
     "Catch",
     "DeepSea",
     "DiscountingChain",

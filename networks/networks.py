@@ -29,6 +29,7 @@ class MLP(linen.Module):
     kernel_init: Initializer = jax.nn.initializers.lecun_uniform()
     activate_final: bool = False
     bias: bool = True
+    normalize_output: bool = False
 
     @linen.compact
     def __call__(self, data: jnp.ndarray):
@@ -42,6 +43,8 @@ class MLP(linen.Module):
                     hidden)
             if i != len(self.layer_sizes) - 1 or self.activate_final:
                 hidden = self.activation(hidden)
+        if self.normalize_output:
+            hidden = linen.LayerNorm()(hidden)
         return hidden
     
 
@@ -201,7 +204,9 @@ def make_representation_function(
     representation_fn = MLP(
         layer_sizes=list(hidden_layer_sizes) + [embedding_dim],
         activation=activation,
-        kernel_init=jax.nn.initializers.lecun_uniform())
+        kernel_init=jax.nn.initializers.lecun_uniform(),
+        normalize_output=True,   
+    )
 
     def apply(processor_params, representation_params, obs):
         obs = preprocess_observation_fn(obs, processor_params)

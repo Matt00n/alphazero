@@ -1,5 +1,6 @@
 from .environments import (
     Acrobot,
+    AcrobotNoTerm,
     # Pendulum,
     CartPole,
     MountainCar,
@@ -32,6 +33,8 @@ def make(env_id: str, **env_kwargs):
         env = ContinuousMountainCar(**env_kwargs)
     elif env_id == "Acrobot-v1":
         env = Acrobot(**env_kwargs)
+    elif env_id == "Acrobot-v2":
+        env = AcrobotNoTerm(**env_kwargs)
 
     # Custom
     elif env_id == "ProcMaze":
@@ -94,6 +97,7 @@ registered_envs = [
     "CartPole-v1",
     "Pendulum-v1",
     "Acrobot-v1",
+    "Acrobot-v2",
     "MountainCar-v0",
     "MountainCarContinuous-v0",
     "Asterix-MinAtar",
