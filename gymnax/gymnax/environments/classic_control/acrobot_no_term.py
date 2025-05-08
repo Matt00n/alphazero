@@ -86,7 +86,7 @@ class AcrobotNoTerm(environment.Environment):
             -jnp.cos(joint_angle1) - jnp.cos(joint_angle2 + joint_angle1) > 1.0
         )
         would_be_terminal = self.would_be_terminal(state, params)
-        reward = -1.0 * (1 - done_angle) * (1.0 - would_be_terminal.astype(float))
+        reward = -1.0 * (1 - done_angle) # * (1.0 - would_be_terminal.astype(float))
 
         # Update state dict and evaluate termination conditions
         new_state = EnvState(
@@ -96,7 +96,7 @@ class AcrobotNoTerm(environment.Environment):
             velocity_2,
             state.time + 1,
         )
-        state = jax.tree_util.tree_map(lambda x, y: jax.lax.select(would_be_terminal, y, x), new_state, state)
+        state = new_state # jax.tree_util.tree_map(lambda x, y: jax.lax.select(would_be_terminal, y, x), new_state, state)
 
         done, truncated = self.is_terminal(state, params)
         return (
