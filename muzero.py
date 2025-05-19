@@ -58,7 +58,7 @@ class Config:
     save_scores = False
 
     # environment
-    env_id = 'Acrobot-v2' # CartPole-v1, Breakout-MinAtar, MountainCar-v0, Acrobot-v1
+    env_id = 'Acrobot-v1' # CartPole-v1, Breakout-MinAtar, MountainCar-v0, Acrobot-v1
     num_envs = 16
     normalize_observations = True 
     action_repeat = 1
@@ -397,42 +397,42 @@ def actor_step(
     
     ################################
 
-    # NOTE: For AlphaZero embedding is env_state, for MuZero
-    # the root output would be the output of MuZero representation network.
-    root = mctx.RootFnOutput(
-        prior_logits=prior_logits,
-        value=value,
-        # The embedding is used only to implement the MuZero model.
-        embedding=env_state, 
-    )
+    # # NOTE: For AlphaZero embedding is env_state, for MuZero
+    # # the root output would be the output of MuZero representation network.
+    # root = mctx.RootFnOutput(
+    #     prior_logits=prior_logits,
+    #     value=value,
+    #     # The embedding is used only to implement the MuZero model.
+    #     embedding=env_state, 
+    # )
 
-    # The recurrent_fn is provided by MuZero dynamics network.
-    # Or true environment for AlphaZero
-    # TODO MCTS: pass in dynamics function for MuZero
-    def recurrent_fn(params, rng_key, action, embedding):
-        # environment (model)
-        env_state = embedding
-        nstate = rollout_env.step(env_state, action)
+    # # The recurrent_fn is provided by MuZero dynamics network.
+    # # Or true environment for AlphaZero
+    # # TODO MCTS: pass in dynamics function for MuZero
+    # def recurrent_fn(params, rng_key, action, embedding):
+    #     # environment (model)
+    #     env_state = embedding
+    #     nstate = rollout_env.step(env_state, action)
 
-        # policy & value networks
-        root_embedding = representation_fn(nstate.obs) 
-        prior_logits, value = forward(root_embedding) # priorly: env_state
+    #     # policy & value networks
+    #     root_embedding = representation_fn(nstate.obs) 
+    #     prior_logits, value = forward(root_embedding) # priorly: env_state
 
-        # Create the new MCTS node.
-        recurrent_fn_output = mctx.RecurrentFnOutput(
-            reward=nstate.reward,
-            # discount when terminal state reached
-            discount= Config.n_step_gamma * jnp.where(
-                nstate.info['truncation'], jnp.ones_like(nstate.done), 1 - nstate.done
-            ), # 1 - nstate.done, 
-            # prior for the new state
-            prior_logits=prior_logits,
-            # value for the new state
-            value=value,
-        )
+    #     # Create the new MCTS node.
+    #     recurrent_fn_output = mctx.RecurrentFnOutput(
+    #         reward=nstate.reward,
+    #         # discount when terminal state reached
+    #         discount= Config.n_step_gamma * jnp.where(
+    #             nstate.info['truncation'], jnp.ones_like(nstate.done), 1 - nstate.done
+    #         ), # 1 - nstate.done, 
+    #         # prior for the new state
+    #         prior_logits=prior_logits,
+    #         # value for the new state
+    #         value=value,
+    #     )
 
-        # Return the new node and the new environment.
-        return recurrent_fn_output, nstate
+    #     # Return the new node and the new environment.
+    #     return recurrent_fn_output, nstate
     ################################
 
     # Running the search.
@@ -933,6 +933,7 @@ def compute_muzero_loss(
     rng: jnp.ndarray,
     az_network: Union[AZNetworks, AtariAZNetworks],
     value_loss_fn: Callable[[Any], jnp.ndarray],
+    num_unroll_steps: int = 5,
     vf_cost: float = 0.5,
     l2_coef: float = 1e-4,
     shared_feature_extractor: bool = False,
@@ -993,7 +994,7 @@ def compute_muzero_loss(
             recurrent_fn_output = mctx.RecurrentFnOutput(
                 reward=reward,
                 # discount when terminal state reached
-                discount=jnp.ones_like(reward), 
+                discount=Config.n_step_gamma * jnp.ones_like(reward), 
                 # prior for the new state
                 prior_logits=prior_logits,
                 # value for the new state
@@ -1085,14 +1086,14 @@ def compute_muzero_loss(
         observations, policy_targets, value_targets, reward_targets, actions, loss_mask = targets_actions_mask
         value_prefix_target, bootstrap_discount, bootstrap_value, bootstrap_obs = value_targets
 
+        target_hidden = representation_apply(normalizer_params, params.representation, observations)
+
         policy_logits = policy_apply(jnp.zeros(1), params.policy,
                                 hidden_states)
         baseline = value_apply(jnp.zeros(1), params.value, hidden_states)
         model_reward, n_hidden_state = dynamics_apply(jnp.zeros(1), params.dynamics,
                                                        hidden_states, actions)
         model_reward = jnp.squeeze(model_reward, axis=-1)
-
-        target_hidden = representation_apply(normalizer_params, params.representation, observations)
 
         # policy loss
         # TODO NEW reanalyze
@@ -1124,7 +1125,6 @@ def compute_muzero_loss(
         # dynamics_loss *= loss_mask
         return n_hidden_state, (loss, policy_loss, v_loss, dynamics_loss)
 
-    num_unroll_steps = 5 # TODO function argument
     targets = (data.unroll_obs, data.policy_targets, (data.value_prefix_targets, data.bootstrap_discounts, 
                                data.bootstrap_values, data.bootstrap_observations), 
                                 data.reward_targets, data.unroll_actions, data.unroll_mask)
@@ -1411,6 +1411,7 @@ def main(_):
         compute_muzero_loss,
         az_network=az_network,
         value_loss_fn=value_loss_fn,
+        num_unroll_steps=Config.loss_unroll_length,
         vf_cost=Config.vf_cost,
         l2_coef=Config.l2_coef,
         shared_feature_extractor=is_atari,
