@@ -62,3 +62,4 @@ class MuZeroTransition(NamedTuple):
     reward_targets: NestedArray
     unroll_actions: NestedArray
     unroll_mask: NestedArray
+    terminal_mask: NestedArray

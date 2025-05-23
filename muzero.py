@@ -97,7 +97,7 @@ class Config:
     per_importance_sampling_beta: float = 1.
 
     # algorithm hyperparameters
-    total_timesteps = int(1e6) 
+    total_timesteps = int(1e6)
     learning_rate = 1e-3 # 3e-4 
     unroll_length = 128 # 512 # 128 
     anneal_lr = True
@@ -108,7 +108,7 @@ class Config:
     # policy params
     embedding_size: int = 64 # 64
     policy_hidden_layer_sizes: Sequence[int] = (32,) * 2 # (32,) * 4 
-    value_hidden_layer_sizes: Sequence[int] = (64,) * 3 # (256,) * 5 
+    value_hidden_layer_sizes: Sequence[int] = (256,) * 3 # (256,) * 5 
     representation_hidden_layer_sizes: Sequence[int] = (64,) * 2 # (32,) * 2
     reward_hidden_layer_sizes: Sequence[int] = (64,) * 2 # (64,) * 2
     nstate_hidden_layer_sizes: Sequence[int] = (64,) * 2 # (64,) * 2
@@ -509,6 +509,7 @@ def actor_step(
         reward_targets=jnp.zeros(batch_shape + (Config.loss_unroll_length,) + nstate.reward.shape[1:]),
         unroll_actions=jnp.zeros(batch_shape + (Config.loss_unroll_length,) + actions.shape[1:]),
         unroll_mask=jnp.zeros(batch_shape + (Config.loss_unroll_length,)),
+        terminal_mask=jnp.zeros(batch_shape + (Config.loss_unroll_length,)),
     ) 
 
 
@@ -833,6 +834,8 @@ def collect_targets(
         expanded_array = jnp.transpose(expanded_array, (0, 2, 1) + tuple(range(3, expanded_array.ndim)))
 
         return expanded_array
+
+    #################### old ########################
     
     T, B = done.shape[:2]  # Extract time and batch dimensions
 
@@ -854,20 +857,37 @@ def collect_targets(
 
     # --- Apply `done` masking ---
     # Expand `done` for broadcasting: [T, B, U]
-    done_expanded = jnp.broadcast_to(done[:, :, None], (T, B, unroll_steps))
+    # done_expanded = jnp.broadcast_to(done[:, :, None], (T, B, unroll_steps))
 
-    # Create a cumulative "done" mask to zero out future steps
-    cumulative_done = jnp.cumsum(done_expanded, axis=2) > 1  # True after first `1` in done
+    # # Create a cumulative "done" mask to zero out future steps
+    # cumulative_done = jnp.cumsum(done_expanded, axis=2) > 1  # True after first `1` in done
 
-    # Convert boolean mask to float and apply it
-    mask = mask * (~cumulative_done).astype(jnp.float32)
+    # # Convert boolean mask to float and apply it
+    # mask = mask * (~cumulative_done).astype(jnp.float32)
+
+    #################### old ########################
+
+    is_terminal_flag_in_unroll_window = create_time_sliced_array(done) # [T,B,U]
+    is_not_terminal_flag_in_unroll_window = 1.0 - is_terminal_flag_in_unroll_window
+
+    prepended_ones = jnp.ones_like(is_not_terminal_flag_in_unroll_window[:, :, :1])
+    flags_for_cumprod = jnp.concatenate(
+        [prepended_ones, is_not_terminal_flag_in_unroll_window[:, :, :-1]],
+        axis=2
+    )
+    propagated_not_terminal_mask = jnp.cumprod(flags_for_cumprod, axis=2) # [T, B, U]
+    # mask = mask * propagated_not_terminal_mask
+    
 
     # Shape [T, B, ...] --> [T, B, U, ...]
     (unroll_obs, target_policy_probs, value_prefix_target, bootstrap_discount, bootstrap_value, bootstrap_obs,
         reward, action) = jax.tree_util.tree_map(create_time_sliced_array, targets)
     
+    # post terminal states
+    reward = reward * propagated_not_terminal_mask
+    
     return (unroll_obs, target_policy_probs, value_prefix_target, bootstrap_discount, bootstrap_value, bootstrap_obs,
-        reward, action, mask)
+        reward, action, mask, propagated_not_terminal_mask)
 
 
 def quantile_regression_loss(
@@ -1083,7 +1103,7 @@ def compute_muzero_loss(
         hidden_states: jnp.ndarray,
         targets_actions_mask: Any,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        observations, policy_targets, value_targets, reward_targets, actions, loss_mask = targets_actions_mask
+        observations, policy_targets, value_targets, reward_targets, actions, term_mask = targets_actions_mask
         value_prefix_target, bootstrap_discount, bootstrap_value, bootstrap_obs = value_targets
 
         target_hidden = representation_apply(normalizer_params, params.representation, observations)
@@ -1107,6 +1127,7 @@ def compute_muzero_loss(
         # bootstrap_value = value_apply(jnp.zeros(1), params.value, bootstrap_hidden)
 
         vs = jnp.expand_dims(value_prefix_target, -1) + jnp.expand_dims(bootstrap_discount, -1) * bootstrap_value
+        vs = vs * term_mask.reshape((term_mask.shape[0],) + (1,) * (vs.ndim - 1))
         v_losses = value_loss_fn(baseline, jax.lax.stop_gradient(vs))
         if per_importance_sampling:
             v_losses *= data.weight
@@ -1118,29 +1139,31 @@ def compute_muzero_loss(
         # consistency loss
         consistency_loss = -optax.cosine_similarity(hidden_states, jax.lax.stop_gradient(target_hidden))
 
-        loss = policy_loss + v_loss + dynamics_loss + consistency_loss
         # loss *= loss_mask # mask out loss on steps beyond actual trajectory (no real target exists)
         # policy_loss *= loss_mask
         # v_loss *= loss_mask
         # dynamics_loss *= loss_mask
-        return n_hidden_state, (loss, policy_loss, v_loss, dynamics_loss)
+        return n_hidden_state, (policy_loss, v_loss, dynamics_loss, consistency_loss)
 
     targets = (data.unroll_obs, data.policy_targets, (data.value_prefix_targets, data.bootstrap_discounts, 
                                data.bootstrap_values, data.bootstrap_observations), 
-                                data.reward_targets, data.unroll_actions, data.unroll_mask)
+                                data.reward_targets, data.unroll_actions, data.terminal_mask)
     # swap batch and unroll axes
     targets = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), targets)
 
     # jax.debug.print('targets: {x}', x=targets)
 
-    _, (loss, policy_loss, v_loss, dynamics_loss) = jax.lax.scan(
+    _, (policy_loss, v_loss, dynamics_loss, consistency_loss) = jax.lax.scan(
         unroll_loss, 
         hidden,
         targets,
         length=num_unroll_steps
     )
 
-    # jax.debug.print('loss: {x}', x=loss)
+    jax.debug.print('policy_loss: {x}', x=policy_loss.shape)
+    jax.debug.print('v_loss: {x}', x=v_loss.shape)
+    jax.debug.print('dynamics_loss: {x}', x=dynamics_loss.shape)
+    jax.debug.print('consistency_loss: {x}', x=consistency_loss.shape)
     
     # policy_logits = policy_apply(jnp.zeros(1), params.policy,
     #                             hidden)
@@ -1179,17 +1202,21 @@ def compute_muzero_loss(
     # entropy = jnp.mean(parametric_action_distribution.entropy(policy_logits, rng))
 
     # total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty
-    mask = jnp.swapaxes(data.unroll_mask, 0, 1) # * jnp.asarray([[0], [1], [1], [1], [1]])
-    total_loss = jnp.mean(loss, where=mask) + l2_penalty
+    unroll_mask = jnp.swapaxes(data.unroll_mask, 0, 1) # * jnp.asarray([[0], [1], [1], [1], [1]])
+    terminal_mask = jnp.swapaxes(data.terminal_mask, 0, 1) # * jnp.asarray([[0], [1], [1], [1], [1]])
+    mask = unroll_mask * terminal_mask
+    consistency_loss = jnp.mean(consistency_loss, where=mask)
     policy_loss = jnp.mean(policy_loss, where=mask)
-    v_loss = jnp.mean(v_loss, where=mask)
-    dynamics_loss = jnp.mean(dynamics_loss, where=mask)
+    v_loss = jnp.mean(v_loss, where=unroll_mask)
+    dynamics_loss = jnp.mean(dynamics_loss, where=unroll_mask)
+    total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty # + consistency_loss
 
     metrics = {
         'total_loss': total_loss,
         'policy_loss': policy_loss,
         'value_loss': v_loss,
         'dynamics_loss': dynamics_loss,
+        'consistency_loss': consistency_loss,
         'l2_penalty': l2_penalty,
         # 'entropy': entropy, 
         # 'approx_kl': jax.lax.stop_gradient(approx_kl), 
@@ -1329,6 +1356,7 @@ def main(_):
         reward_targets=jnp.zeros(Config.loss_unroll_length),
         unroll_actions=jnp.zeros(Config.loss_unroll_length),
         unroll_mask=jnp.zeros(Config.loss_unroll_length),
+        terminal_mask=jnp.zeros(Config.loss_unroll_length),
     )
     
     if Config.per_alpha > -1:
@@ -1556,12 +1584,13 @@ def main(_):
                                data.bootstrap_value, data.bootstrap_observation,
                                 data.reward, data.action)
         (unroll_obs, policy_targets, value_prefix_targets, bootstrap_discounts, bootstrap_values, bootstrap_observations,
-         reward_targets, unroll_actions, unroll_mask) = collect_targets(targets, 1-data.discount, Config.loss_unroll_length)
+         reward_targets, unroll_actions, unroll_mask, terminal_mask) = collect_targets(targets, 1-data.discount, Config.loss_unroll_length)
         
         data = data._replace(unroll_obs=unroll_obs, policy_targets=policy_targets, value_prefix_targets=value_prefix_targets,
                       bootstrap_discounts=bootstrap_discounts, bootstrap_values=bootstrap_values, 
                       bootstrap_observations=bootstrap_observations,
-                      reward_targets=reward_targets, unroll_actions=unroll_actions, unroll_mask=unroll_mask)
+                      reward_targets=reward_targets, unroll_actions=unroll_actions, unroll_mask=unroll_mask,
+                      terminal_mask=terminal_mask)
         
         # Have leading dimensions (batch_size * num_minibatches, unroll_length)
         # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
@@ -1709,12 +1738,13 @@ def main(_):
                                data.bootstrap_value, data.bootstrap_observation,
                                 data.reward, data.action)
         (unroll_obs, policy_targets, value_prefix_targets, bootstrap_discounts, bootstrap_values, bootstrap_observations,
-         reward_targets, unroll_actions, unroll_mask) = collect_targets(targets, 1-data.discount, Config.loss_unroll_length)
+         reward_targets, unroll_actions, unroll_mask, terminal_mask) = collect_targets(targets, 1-data.discount, Config.loss_unroll_length)
         
         data = data._replace(unroll_obs=unroll_obs, policy_targets=policy_targets, value_prefix_targets=value_prefix_targets,
                       bootstrap_discounts=bootstrap_discounts, bootstrap_values=bootstrap_values, 
                       bootstrap_observations=bootstrap_observations,
-                      reward_targets=reward_targets, unroll_actions=unroll_actions, unroll_mask=unroll_mask)
+                      reward_targets=reward_targets, unroll_actions=unroll_actions, unroll_mask=unroll_mask,
+                      terminal_mask=terminal_mask)
         
 
         # Have leading dimensions (batch_size * num_minibatches, unroll_length)

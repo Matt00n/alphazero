@@ -15,7 +15,7 @@ This is a reimplementation of the infamous [AlphaZero](https://arxiv.org/abs/171
 
 ### Potential future extensions (if I have time...)
 
-* Extension to [MuZero](https://arxiv.org/abs/1911.08265) by learning dynamics model.
+* Extension to [MuZero](https://arxiv.org/abs/1911.08265) by learning dynamics model. *This is work in progress and not fully functional yet!*.
 * Finishing REANALYZE.
 * Enable choosing MCTS version (standard, sampled, Gumbel, stochastic) via Config (has to be manually changed currently).
 * Support for continuous action spaces
