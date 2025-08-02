@@ -97,7 +97,7 @@ class Config:
     per_importance_sampling_beta: float = 1.
 
     # algorithm hyperparameters
-    total_timesteps = int(1e6)
+    total_timesteps = int(1e6) * 3
     learning_rate = 1e-3 # 3e-4 
     unroll_length = 128 # 512 # 128 
     anneal_lr = True
@@ -236,6 +236,7 @@ def make_forward_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
             
             logits = policy_network.apply(normalizer_params, policy_params, observations)
             value = value_network.apply(normalizer_params, value_params, observations)
+            value = inverse_scalar_transform(value) # VALUE TEST
 
             return logits, value
 
@@ -271,6 +272,7 @@ def make_dynamics_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
         @jax.jit # TODO jit needed ?
         def dynamics_fn(observations: jnp.ndarray, actions: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:            
             reward, hidden_state = dynamics_network.apply(normalizer_params, dynamics_params, observations, actions)
+            reward = inverse_scalar_transform(reward) # get expected value of distributional reward estimate
             return jnp.mean(reward, axis=-1), hidden_state
 
         return dynamics_fn
@@ -315,7 +317,7 @@ def make_az_networks(
     dynamics_network = make_dynamics_network(
         embedding_size=embedding_size,
         num_actions=action_size,
-        num_reward_atoms=num_atoms,
+        num_reward_atoms=601, # TODO get as input
         preprocess_observation_fn=lambda x, y: x,
         hidden_layer_sizes_reward=reward_hidden_layer_sizes,
         hidden_layer_sizes_next_state=nstate_hidden_layer_sizes,
@@ -329,7 +331,7 @@ def make_az_networks(
         activation=activation)
     value_network = make_value_network(
         (embedding_size,),
-        num_atoms=num_atoms,
+        num_atoms=601, # value test
         preprocess_observation_fn=lambda x, y: x,
         hidden_layer_sizes=value_hidden_layer_sizes,
         activation=activation)
@@ -665,6 +667,56 @@ def reanalyze(data: MuZeroTransition,
                                     data)
     
     return data
+
+
+def invertible_scalar_transformation(
+    x: jnp.ndarray,
+    num_atoms: int,
+) -> jnp.ndarray:
+    epsilon = 0.001
+    sign = jnp.sign(x)
+    x = sign * (jnp.sqrt(jnp.abs(x) + 1) - 1) + epsilon * x
+
+    # remove the trailing singleton if present
+    x = jnp.squeeze(x)  # now shape [...]
+    M = num_atoms // 2
+    centers = jnp.arange(-M, M + 1, dtype=x.dtype)  # shape (S,)
+    # clip outliers in original array
+    x = jnp.clip(x, -M, M)
+    # compute 1 - |x - i|; this is positive only for |x - i| < 1, i.e. only at floor(x) and ceil(x)
+    w = 1.0 - jnp.abs(x[..., None] - centers)        # shape [..., S]
+    # clip negatives to zero
+    return jnp.clip(w, 0.0)
+
+
+def inverse_scalar_transform(logits: jnp.ndarray):
+    """ Reference from MuZerp: Appendix F => Network Architecture
+    & Appendix A : Proposition A.2 in https://arxiv.org/pdf/1805.11593.pdf (Page-11)
+    """
+    value_probs = jax.nn.softmax(logits, axis=-1)
+
+    n = value_probs.shape[-1]    
+    k = (n - 1) // 2
+    values = jnp.arange(-k, k + 1, dtype=jnp.float32)  # shape (2k+1,)
+    
+    # Reshape values to broadcast over batch dimensions
+    # e.g., if prob_array has shape (batch1, batch2, ..., 2k+1)
+    # we want values to have shape (1, 1, ..., 2k+1) with correct number of leading 1s
+    broadcast_shape = (1,) * (value_probs.ndim - 1) + (n,)
+    value_array = values.reshape(broadcast_shape)
+
+    # Expected value
+    value = (value_array * value_probs).sum(axis=-1, keepdims=True)
+
+    epsilon = 0.001
+    sign = jnp.sign(value)
+    output = (((jnp.sqrt(1 + 4 * epsilon * (jnp.abs(value) + 1 + epsilon)) - 1) / (2 * epsilon)) ** 2 - 1)
+    output = sign * output
+
+    nan_part = jnp.isnan(output)
+    output = jnp.where(nan_part, 0., output) 
+    output = jnp.where(jnp.abs(output) < epsilon, 0., output) 
+    return output
     
 
 def n_step_bootstrapped_targets(
@@ -1113,7 +1165,6 @@ def compute_muzero_loss(
         baseline = value_apply(jnp.zeros(1), params.value, hidden_states)
         model_reward, n_hidden_state = dynamics_apply(jnp.zeros(1), params.dynamics,
                                                        hidden_states, actions)
-        model_reward = jnp.squeeze(model_reward, axis=-1)
 
         # policy loss
         # TODO NEW reanalyze
@@ -1126,15 +1177,34 @@ def compute_muzero_loss(
         # bootstrap_value = reanalyze_value(bootstrap_hidden)
         # bootstrap_value = value_apply(jnp.zeros(1), params.value, bootstrap_hidden)
 
+        # chex.assert_shape(value_prefix_target, (Config.replay_buffer_batch_size, 601))
+        # chex.assert_shape(bootstrap_discount, (Config.replay_buffer_batch_size, 601))
+        # chex.assert_shape(bootstrap_value, (Config.replay_buffer_batch_size, Config.num_atoms))
         vs = jnp.expand_dims(value_prefix_target, -1) + jnp.expand_dims(bootstrap_discount, -1) * bootstrap_value
+        chex.assert_shape(vs, (Config.replay_buffer_batch_size, Config.num_atoms))
+        chex.assert_shape(term_mask, (Config.replay_buffer_batch_size,))
         vs = vs * term_mask.reshape((term_mask.shape[0],) + (1,) * (vs.ndim - 1))
-        v_losses = value_loss_fn(baseline, jax.lax.stop_gradient(vs))
+        chex.assert_shape(vs, (Config.replay_buffer_batch_size, Config.num_atoms))
+        # v_losses = value_loss_fn(baseline, jax.lax.stop_gradient(vs))
+
+        # VALUE TEST
+        vs = invertible_scalar_transformation(vs, 601)
+        chex.assert_shape(vs, (Config.replay_buffer_batch_size, 601))
+        chex.assert_shape(baseline, (Config.replay_buffer_batch_size, 601))
+        v_losses = -jnp.sum(jax.lax.stop_gradient(vs)*(jax.nn.log_softmax(baseline)), axis=-1)
+
         if per_importance_sampling:
             v_losses *= data.weight
         v_loss = vf_cost * v_losses
+        chex.assert_shape(v_loss, (Config.replay_buffer_batch_size,))
 
         # dynamics (reward) function loss 
-        dynamics_loss = mse_value_loss(model_reward, jax.lax.stop_gradient(reward_targets))
+        # TODO get reward atoms as input
+        reward_targets = invertible_scalar_transformation(reward_targets, 601) # distributional value loss, see MuZero paper
+        dynamics_loss = -jnp.sum(jax.lax.stop_gradient(reward_targets)*(jax.nn.log_softmax(model_reward)), axis=-1)
+        # old:
+        # model_reward = jnp.squeeze(model_reward, axis=-1)
+        # dynamics_loss = mse_value_loss(model_reward, jax.lax.stop_gradient(reward_targets))
 
         # consistency loss
         consistency_loss = -optax.cosine_similarity(hidden_states, jax.lax.stop_gradient(target_hidden))
@@ -1144,6 +1214,8 @@ def compute_muzero_loss(
         # v_loss *= loss_mask
         # dynamics_loss *= loss_mask
         return n_hidden_state, (policy_loss, v_loss, dynamics_loss, consistency_loss)
+    
+    chex.assert_shape(data.bootstrap_values, (Config.replay_buffer_batch_size, Config.loss_unroll_length, Config.num_atoms))
 
     targets = (data.unroll_obs, data.policy_targets, (data.value_prefix_targets, data.bootstrap_discounts, 
                                data.bootstrap_values, data.bootstrap_observations), 
@@ -1160,10 +1232,10 @@ def compute_muzero_loss(
         length=num_unroll_steps
     )
 
-    jax.debug.print('policy_loss: {x}', x=policy_loss.shape)
-    jax.debug.print('v_loss: {x}', x=v_loss.shape)
-    jax.debug.print('dynamics_loss: {x}', x=dynamics_loss.shape)
-    jax.debug.print('consistency_loss: {x}', x=consistency_loss.shape)
+    # jax.debug.print('policy_loss: {x}', x=policy_loss.shape)
+    # jax.debug.print('v_loss: {x}', x=v_loss.shape)
+    # jax.debug.print('dynamics_loss: {x}', x=dynamics_loss.shape)
+    # jax.debug.print('consistency_loss: {x}', x=consistency_loss.shape)
     
     # policy_logits = policy_apply(jnp.zeros(1), params.policy,
     #                             hidden)
@@ -1202,14 +1274,20 @@ def compute_muzero_loss(
     # entropy = jnp.mean(parametric_action_distribution.entropy(policy_logits, rng))
 
     # total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty
+    # test_mask = jnp.asarray([[1], [0], [0], [0], [0]])
     unroll_mask = jnp.swapaxes(data.unroll_mask, 0, 1) # * jnp.asarray([[0], [1], [1], [1], [1]])
     terminal_mask = jnp.swapaxes(data.terminal_mask, 0, 1) # * jnp.asarray([[0], [1], [1], [1], [1]])
+    chex.assert_shape(unroll_mask, (Config.loss_unroll_length, Config.replay_buffer_batch_size))
+    chex.assert_shape(terminal_mask, (Config.loss_unroll_length, Config.replay_buffer_batch_size))
+    chex.assert_shape(v_loss, (Config.loss_unroll_length, Config.replay_buffer_batch_size))
+    chex.assert_shape(policy_loss, (Config.loss_unroll_length, Config.replay_buffer_batch_size))
+    chex.assert_shape(dynamics_loss, (Config.loss_unroll_length, Config.replay_buffer_batch_size))
     mask = unroll_mask * terminal_mask
     consistency_loss = jnp.mean(consistency_loss, where=mask)
     policy_loss = jnp.mean(policy_loss, where=mask)
     v_loss = jnp.mean(v_loss, where=unroll_mask)
     dynamics_loss = jnp.mean(dynamics_loss, where=unroll_mask)
-    total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty # + consistency_loss
+    total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty + consistency_loss 
 
     metrics = {
         'total_loss': total_loss,

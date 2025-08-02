@@ -203,9 +203,9 @@ def make_representation_function(
     """Creates a CNN feature extractor."""
     representation_fn = MLP(
         layer_sizes=list(hidden_layer_sizes) + [embedding_dim],
-        activation=linen.tanh, # activation,
+        activation=activation, # linen.tanh, # 
         kernel_init=jax.nn.initializers.lecun_uniform(),
-        # normalize_output=True,   
+        normalize_output=True,   
         activate_final=True,
     )
 
@@ -236,9 +236,9 @@ class DualMLP(linen.Module):
         )(hidden)
         out2 = MLP(
             layer_sizes=self.layer_sizes_2,
-            activation=linen.tanh, # self.activation,
+            activation=self.activation, #  linen.tanh, # 
             kernel_init=jax.nn.initializers.lecun_uniform(),
-            # normalize_output=True,
+            normalize_output=True,
             activate_final=True,
         )(hidden)
         return out1, out2
