@@ -1,17 +1,17 @@
 import dataclasses
 from typing import Any, Callable, Sequence
 
-from flax import linen
 import jax
 import jax.numpy as jnp
-
-
+from flax import linen
 
 ActivationFn = Callable[[jnp.ndarray], jnp.ndarray]
 Initializer = Callable[..., Any]
 
-def identity_observation_preprocessor(observation: jnp.ndarray,
-                                      preprocessor_params: Any):
+
+def identity_observation_preprocessor(
+    observation: jnp.ndarray, preprocessor_params: Any
+):
     del preprocessor_params
     return observation
 
@@ -24,6 +24,7 @@ class FeedForwardNetwork:
 
 class MLP(linen.Module):
     """MLP module."""
+
     layer_sizes: Sequence[int]
     activation: ActivationFn = linen.relu
     kernel_init: Initializer = jax.nn.initializers.lecun_uniform()
@@ -37,19 +38,20 @@ class MLP(linen.Module):
         for i, hidden_size in enumerate(self.layer_sizes):
             hidden = linen.Dense(
                 hidden_size,
-                name=f'hidden_{i}',
+                name=f"hidden_{i}",
                 kernel_init=self.kernel_init,
-                use_bias=self.bias)(
-                    hidden)
+                use_bias=self.bias,
+            )(hidden)
             if i != len(self.layer_sizes) - 1 or self.activate_final:
                 hidden = self.activation(hidden)
         if self.normalize_output:
             hidden = linen.LayerNorm()(hidden)
         return hidden
-    
+
 
 class AtariTorso(linen.Module):
     """ConvNet Feature Extractor."""
+
     layer_sizes: Sequence[int] = (512,)
     activation: ActivationFn = linen.relu
     kernel_init: Initializer = jax.nn.initializers.orthogonal(jnp.sqrt(2))
@@ -97,7 +99,7 @@ class AtariTorso(linen.Module):
             kernel_size=(3, 3),
             strides=(1, 1),
             padding="VALID",
-            name='conv_3',
+            name="conv_3",
             kernel_init=self.kernel_init,
             bias_init=jax.nn.initializers.constant(0.0),
         )(hidden)
@@ -107,34 +109,35 @@ class AtariTorso(linen.Module):
             kernel_size=(2, 2),
             strides=(1, 1),
             padding="VALID",
-            name='conv_4',
+            name="conv_4",
             kernel_init=self.kernel_init,
             bias_init=jax.nn.initializers.constant(0.0),
         )(hidden)
         hidden = self.activation(hidden)
 
         hidden = hidden.reshape(hidden.shape[:-3] + (-1,))
-        hidden = linen.Dense(512, 
-                             kernel_init=self.kernel_init, 
-                             bias_init=jax.nn.initializers.constant(0.0)
-                             )(hidden)
+        hidden = linen.Dense(
+            512,
+            kernel_init=self.kernel_init,
+            bias_init=jax.nn.initializers.constant(0.0),
+        )(hidden)
         for i, hidden_size in enumerate(self.layer_sizes):
             hidden = linen.Dense(
                 hidden_size,
-                name=f'hidden_{i}',
+                name=f"hidden_{i}",
                 kernel_init=self.kernel_init,
                 bias_init=jax.nn.initializers.constant(0.0),
-                use_bias=self.bias)(
-                    hidden)
+                use_bias=self.bias,
+            )(hidden)
             hidden = self.activation(hidden)
         return hidden
-    
+
 
 def make_atari_feature_extractor(
     obs_size: int,
     preprocess_observation_fn: Callable = identity_observation_preprocessor,
     hidden_layer_sizes: Sequence[int] = (256, 256),
-    activation: ActivationFn = linen.relu
+    activation: ActivationFn = linen.relu,
 ) -> FeedForwardNetwork:
     """Creates a CNN feature extractor."""
     feature_extractor = AtariTorso(
@@ -148,27 +151,32 @@ def make_atari_feature_extractor(
 
     dummy_obs = jnp.zeros((1,) + obs_size)
     return FeedForwardNetwork(
-        init=lambda key: feature_extractor.init(key, dummy_obs), apply=apply)
+        init=lambda key: feature_extractor.init(key, dummy_obs), apply=apply
+    )
+
 
 def make_policy_network(
-        param_size: int,
-        obs_size: int,
-        preprocess_observation_fn: Callable = identity_observation_preprocessor,
-        hidden_layer_sizes: Sequence[int] = (256, 256),
-        activation: ActivationFn = linen.relu) -> FeedForwardNetwork:
+    param_size: int,
+    obs_size: int,
+    preprocess_observation_fn: Callable = identity_observation_preprocessor,
+    hidden_layer_sizes: Sequence[int] = (256, 256),
+    activation: ActivationFn = linen.relu,
+) -> FeedForwardNetwork:
     """Creates a policy network."""
     policy_module = MLP(
         layer_sizes=list(hidden_layer_sizes) + [param_size],
         activation=activation,
-        kernel_init=jax.nn.initializers.lecun_uniform())
+        kernel_init=jax.nn.initializers.lecun_uniform(),
+    )
 
     def apply(processor_params, policy_params, obs):
         obs = preprocess_observation_fn(obs, processor_params)
         return policy_module.apply(policy_params, obs)
 
-    dummy_obs = jnp.zeros((1,) + obs_size) # jnp.zeros((1, obs_size))
+    dummy_obs = jnp.zeros((1,) + obs_size)  # jnp.zeros((1, obs_size))
     return FeedForwardNetwork(
-        init=lambda key: policy_module.init(key, dummy_obs), apply=apply)
+        init=lambda key: policy_module.init(key, dummy_obs), apply=apply
+    )
 
 
 def make_value_network(
@@ -176,21 +184,24 @@ def make_value_network(
     num_atoms: int = 1,
     preprocess_observation_fn: Callable = identity_observation_preprocessor,
     hidden_layer_sizes: Sequence[int] = (256, 256),
-    activation: ActivationFn = linen.relu) -> FeedForwardNetwork:
+    activation: ActivationFn = linen.relu,
+) -> FeedForwardNetwork:
     """Creates a policy network."""
     value_module = MLP(
         layer_sizes=list(hidden_layer_sizes) + [num_atoms],
         activation=activation,
-        kernel_init=jax.nn.initializers.lecun_uniform())
+        kernel_init=jax.nn.initializers.lecun_uniform(),
+    )
 
     def apply(processor_params, policy_params, obs):
         obs = preprocess_observation_fn(obs, processor_params)
         # return jnp.squeeze(value_module.apply(policy_params, obs), axis=-1)
         return value_module.apply(policy_params, obs)
 
-    dummy_obs = jnp.zeros((1,) + obs_size) # jnp.zeros((1, obs_size))
+    dummy_obs = jnp.zeros((1,) + obs_size)  # jnp.zeros((1, obs_size))
     return FeedForwardNetwork(
-        init=lambda key: value_module.init(key, dummy_obs), apply=apply)
+        init=lambda key: value_module.init(key, dummy_obs), apply=apply
+    )
 
 
 def make_representation_function(
@@ -198,14 +209,14 @@ def make_representation_function(
     embedding_dim: int,
     preprocess_observation_fn: Callable = identity_observation_preprocessor,
     hidden_layer_sizes: Sequence[int] = (256, 256),
-    activation: ActivationFn = linen.relu
+    activation: ActivationFn = linen.relu,
 ) -> FeedForwardNetwork:
-    """Creates a CNN feature extractor."""
+    """Creates a MLP feature extractor."""
     representation_fn = MLP(
         layer_sizes=list(hidden_layer_sizes) + [embedding_dim],
-        activation=activation, # linen.tanh, # 
+        activation=activation,  # linen.tanh, #
         kernel_init=jax.nn.initializers.lecun_uniform(),
-        normalize_output=True,   
+        normalize_output=True,
         activate_final=True,
     )
 
@@ -215,11 +226,40 @@ def make_representation_function(
 
     dummy_obs = jnp.zeros((1,) + obs_size)
     return FeedForwardNetwork(
-        init=lambda key: representation_fn.init(key, dummy_obs), apply=apply)
+        init=lambda key: representation_fn.init(key, dummy_obs), apply=apply
+    )
+
+
+# TODO temp oracle test, undo
+def make_tmp_representation_function(
+    obs_size: int,
+    embedding_dim: int,
+    preprocess_observation_fn: Callable = identity_observation_preprocessor,
+    hidden_layer_sizes: Sequence[int] = (256, 256),
+    activation: ActivationFn = linen.relu,
+) -> FeedForwardNetwork:
+    """Creates a MLP feature extractor."""
+    representation_fn = MLP(
+        layer_sizes=list(hidden_layer_sizes) + [embedding_dim],
+        activation=activation,  # linen.tanh, #
+        kernel_init=jax.nn.initializers.lecun_uniform(),
+        normalize_output=True,
+        activate_final=True,
+    )
+
+    def apply(processor_params, representation_params, obs):
+        obs = preprocess_observation_fn(obs, processor_params)
+        return obs  # representation_fn.apply(representation_params, obs)
+
+    dummy_obs = jnp.zeros((1,) + obs_size)
+    return FeedForwardNetwork(
+        init=lambda key: representation_fn.init(key, dummy_obs), apply=apply
+    )
 
 
 class DualMLP(linen.Module):
     """MLP module."""
+
     layer_sizes_1: Sequence[int]
     layer_sizes_2: Sequence[int]
     activation: ActivationFn = linen.relu
@@ -232,11 +272,11 @@ class DualMLP(linen.Module):
         out1 = MLP(
             layer_sizes=self.layer_sizes_1,
             activation=self.activation,
-            kernel_init=jax.nn.initializers.lecun_uniform()
+            kernel_init=jax.nn.initializers.lecun_uniform(),
         )(hidden)
         out2 = MLP(
             layer_sizes=self.layer_sizes_2,
-            activation=self.activation, #  linen.tanh, # 
+            activation=self.activation,  #  linen.tanh, #
             kernel_init=jax.nn.initializers.lecun_uniform(),
             normalize_output=True,
             activate_final=True,
@@ -251,20 +291,24 @@ def make_dynamics_network(
     preprocess_observation_fn: Callable = identity_observation_preprocessor,
     hidden_layer_sizes_reward: Sequence[int] = (256, 256),
     hidden_layer_sizes_next_state: Sequence[int] = (256, 256),
-    activation: ActivationFn = linen.relu) -> FeedForwardNetwork:
+    activation: ActivationFn = linen.relu,
+) -> FeedForwardNetwork:
     """Creates a policy network."""
     dynamics_module = DualMLP(
         layer_sizes_1=list(hidden_layer_sizes_reward) + [num_reward_atoms],
         layer_sizes_2=list(hidden_layer_sizes_next_state) + [embedding_size],
         activation=activation,
-        kernel_init=jax.nn.initializers.lecun_uniform())
+        kernel_init=jax.nn.initializers.lecun_uniform(),
+    )
 
     def apply(processor_params, dynamics_params, obs, actions):
         obs = preprocess_observation_fn(obs, processor_params)
-        obs = jnp.concatenate([obs, jax.nn.one_hot(actions, num_actions)],
-                                            axis=1)
+        obs = jnp.concatenate([obs, jax.nn.one_hot(actions, num_actions)], axis=1)
         return dynamics_module.apply(dynamics_params, obs)
 
-    dummy_obs = jnp.zeros((1,) + (embedding_size + num_actions,)) # jnp.zeros((1, obs_size))
+    dummy_obs = jnp.zeros(
+        (1,) + (embedding_size + num_actions,)
+    )  # jnp.zeros((1, obs_size))
     return FeedForwardNetwork(
-        init=lambda key: dynamics_module.init(key, dummy_obs), apply=apply)
+        init=lambda key: dynamics_module.init(key, dummy_obs), apply=apply
+    )
