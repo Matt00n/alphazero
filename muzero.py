@@ -105,6 +105,18 @@ class Config:
 
     loss_unroll_length: int = 5
 
+    # ### PORTED FROM muzero_ablate (BOTTOM-UP STEP 2b): MuZero gradient scaling ###
+    # Gradient through each recurrent hidden state fed into the next dynamics call
+    # is scaled by this factor (MuZero pseudocode: scale_gradient(hidden_state, 0.5)).
+    # 1.0 = off (previous behaviour, exact identity).
+    dynamics_gradient_scale: float = 0.5
+
+    # ### PORTED FROM muzero_ablate (BOTTOM-UP STEP 2c): MuZero per-step loss weights ###
+    # True:  policy/value loss weight 1 at k=0 and 1/K for each recurrent step k>=1
+    #        (normalised), as in the MuZero pseudocode.
+    # False: uniform mean over unroll steps (previous behaviour).
+    muzero_loss_weighting: bool = True
+
     # reanalyze
     reanalyze: bool = False
 
@@ -1390,10 +1402,26 @@ def compute_muzero_loss(
     hidden = representation_apply(normalizer_params, params.representation, hidden)
 
     # scan loss over K unroll steps of dynamics model
+    # ######################################################################
+    # ### PORTED FROM muzero_ablate (BOTTOM-UP STEP 2b): MuZero gradient scaling
+    # ### (Config.dynamics_gradient_scale). MuZero pseudocode (update_weights):
+    # ###   for action in actions:
+    # ###       ..., hidden_state = network.recurrent_inference(hidden_state, action)
+    # ###       hidden_state = scale_gradient(hidden_state, 0.5)
+    # ### i.e. the representation output (k=0) enters the first dynamics call
+    # ### unscaled; every later recurrent hidden state is scaled before it enters
+    # ### the next dynamics call. The heads always see the unscaled hidden state.
+    # ### Forward values are unchanged, only gradients are scaled.
+    # ######################################################################
+    def scale_gradient(x: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
+        return x * scale + jax.lax.stop_gradient(x) * (1.0 - scale)
+
     def unroll_loss(
-        hidden_states: jnp.ndarray,
+        carry: Tuple[jnp.ndarray, jnp.ndarray],
         targets_actions_mask: Any,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], Any]:
+        # ### PORTED (STEP 2b): carry = (hidden state, gradient scale for dynamics input)
+        hidden_states, dynamics_input_grad_scale = carry
         (
             observations,
             policy_targets,
@@ -1413,7 +1441,11 @@ def compute_muzero_loss(
         policy_logits = policy_apply(jnp.zeros(1), params.policy, hidden_states)
         baseline = value_apply(jnp.zeros(1), params.value, hidden_states)
         model_reward, n_hidden_state = dynamics_apply(
-            jnp.zeros(1), params.dynamics, hidden_states, actions
+            jnp.zeros(1),
+            params.dynamics,
+            # ### PORTED (STEP 2b), was: hidden_states
+            scale_gradient(hidden_states, dynamics_input_grad_scale),
+            actions,
         )
 
         # policy loss
@@ -1484,7 +1516,16 @@ def compute_muzero_loss(
         # policy_loss *= loss_mask
         # v_loss *= loss_mask
         # dynamics_loss *= loss_mask
-        return n_hidden_state, (policy_loss, v_loss, dynamics_loss, consistency_loss)
+        # ### PORTED (STEP 2b): all later dynamics inputs get the configured scale
+        next_grad_scale = jnp.full_like(
+            dynamics_input_grad_scale, Config.dynamics_gradient_scale
+        )
+        return (n_hidden_state, next_grad_scale), (
+            policy_loss,
+            v_loss,
+            dynamics_loss,
+            consistency_loss,
+        )
 
     chex.assert_shape(
         data.bootstrap_values,
@@ -1510,8 +1551,13 @@ def compute_muzero_loss(
     # jax.debug.print('targets: {x}', x=targets)
 
     _, (policy_loss, v_loss, dynamics_loss, consistency_loss) = jax.lax.scan(
-        unroll_loss, hidden, targets, length=num_unroll_steps
+        unroll_loss,
+        # ### PORTED (STEP 2b): first dynamics call (on representation output) unscaled
+        (hidden, jnp.ones((), dtype=hidden.dtype)),
+        targets,
+        length=num_unroll_steps,
     )
+    # ### END PORTED (STEP 2b) ###################################################
 
     # jax.debug.print('policy_loss: {x}', x=policy_loss.shape)
     # jax.debug.print('v_loss: {x}', x=v_loss.shape)
@@ -1581,10 +1627,55 @@ def compute_muzero_loss(
         dynamics_loss, (Config.loss_unroll_length, Config.replay_buffer_batch_size)
     )
     mask = unroll_mask * terminal_mask
+
+    # ######################################################################
+    # ### PORTED FROM muzero_ablate (BOTTOM-UP STEP 2c): MuZero per-step loss
+    # ### weights (Config.muzero_loss_weighting)
+    # ### MuZero pseudocode: prediction at k=0 (initial inference) has gradient
+    # ### scale 1, each of the K recurrent steps 1/K. Weights are normalised to
+    # ### sum to 1 (k=0: 0.5, each k>=1: 0.5/K) to keep the loss scale.
+    # ### Applied to policy and value losses. The reward (dynamics) loss stays
+    # ### uniform: here every reward prediction already comes from a recurrent
+    # ### step (dynamics_apply), i.e. all have weight 1/K in MuZero.
+    # ### With the flag off (or loss_unroll_length == 1) the weights are uniform,
+    # ### which reproduces the previous jnp.mean(..., where=mask) exactly.
+    # ### Old:
+    # # policy_loss = jnp.mean(policy_loss, where=mask)
+    # # v_loss = jnp.mean(v_loss, where=unroll_mask)
+    # ######################################################################
+    num_steps = policy_loss.shape[0]
+    if Config.muzero_loss_weighting and num_steps > 1:
+        step_weights = jnp.concatenate(
+            [jnp.ones(1), jnp.full((num_steps - 1,), 1.0 / (num_steps - 1))]
+        )
+    else:
+        step_weights = jnp.ones(num_steps)
+    step_weights = (step_weights / jnp.sum(step_weights))[:, None]  # [U, 1]
+
+    def weighted_masked_mean(loss, loss_mask, weights):
+        w = weights * loss_mask
+        return jnp.sum(jnp.where(w > 0, loss * w, 0.0)) / jnp.maximum(
+            jnp.sum(w), 1e-8
+        )
+
+    # per-k diagnostics (unweighted masked means), comparable across runs
+    def masked_mean(loss, loss_mask):
+        return jnp.sum(jnp.where(loss_mask > 0, loss, 0.0)) / jnp.maximum(
+            jnp.sum(loss_mask), 1.0
+        )
+
+    unroll_diagnostics = {
+        "policy_loss_k0": masked_mean(policy_loss[:1], mask[:1]),
+        "policy_loss_k1plus": masked_mean(policy_loss[1:], mask[1:]),
+        "value_loss_k0": masked_mean(v_loss[:1], unroll_mask[:1]),
+        "value_loss_k1plus": masked_mean(v_loss[1:], unroll_mask[1:]),
+    }
+
     consistency_loss = jnp.mean(consistency_loss, where=mask)
-    policy_loss = jnp.mean(policy_loss, where=mask)
-    v_loss = jnp.mean(v_loss, where=unroll_mask)
+    policy_loss = weighted_masked_mean(policy_loss, mask, step_weights)
+    v_loss = weighted_masked_mean(v_loss, unroll_mask, step_weights)
     dynamics_loss = jnp.mean(dynamics_loss, where=unroll_mask)
+    # ### END PORTED (STEP 2c) ###############################################
     total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty  # + consistency_loss
 
     metrics = {
@@ -1594,6 +1685,7 @@ def compute_muzero_loss(
         "dynamics_loss": dynamics_loss,
         "consistency_loss": consistency_loss,
         "l2_penalty": l2_penalty,
+        **unroll_diagnostics,  # ### PORTED (STEP 2c)
         # 'entropy': entropy,
         # 'approx_kl': jax.lax.stop_gradient(approx_kl),
     }

@@ -124,6 +124,12 @@ class Config:
     # 1.0 = off (previous behaviour, exact identity).
     dynamics_gradient_scale: float = 0.5
 
+    # ### BOTTOM-UP STEP 2c: MuZero per-step loss weights (search "BOTTOM-UP STEP 2c") ###
+    # True:  policy/value loss weight 1 at k=0 and 1/K for each recurrent step k>=1
+    #        (normalised), as in the MuZero pseudocode.
+    # False: uniform mean over unroll steps (previous behaviour).
+    muzero_loss_weighting: bool = True
+
     # reanalyze
     reanalyze: bool = False
 
@@ -1701,10 +1707,54 @@ def compute_muzero_loss(
         dynamics_loss, (Config.loss_unroll_length, Config.replay_buffer_batch_size)
     )
     mask = unroll_mask * terminal_mask
+
+    # ######################################################################
+    # ### BOTTOM-UP STEP 2c: MuZero per-step loss weights (Config.muzero_loss_weighting)
+    # ### MuZero pseudocode: prediction at k=0 (initial inference) has gradient
+    # ### scale 1, each of the K recurrent steps 1/K. Weights are normalised to
+    # ### sum to 1 (k=0: 0.5, each k>=1: 0.5/K) to keep the loss scale.
+    # ### Applied to policy and value losses. The reward (dynamics) loss stays
+    # ### uniform: here every reward prediction already comes from a recurrent
+    # ### step (dynamics_apply), i.e. all have weight 1/K in MuZero.
+    # ### With the flag off (or loss_unroll_length == 1) the weights are uniform,
+    # ### which reproduces the previous jnp.mean(..., where=mask) exactly.
+    # ### Old:
+    # # policy_loss = jnp.mean(policy_loss, where=mask)
+    # # v_loss = jnp.mean(v_loss, where=unroll_mask)
+    # ######################################################################
+    num_steps = policy_loss.shape[0]
+    if Config.muzero_loss_weighting and num_steps > 1:
+        step_weights = jnp.concatenate(
+            [jnp.ones(1), jnp.full((num_steps - 1,), 1.0 / (num_steps - 1))]
+        )
+    else:
+        step_weights = jnp.ones(num_steps)
+    step_weights = (step_weights / jnp.sum(step_weights))[:, None]  # [U, 1]
+
+    def weighted_masked_mean(loss, loss_mask, weights):
+        w = weights * loss_mask
+        return jnp.sum(jnp.where(w > 0, loss * w, 0.0)) / jnp.maximum(
+            jnp.sum(w), 1e-8
+        )
+
+    # per-k diagnostics (unweighted masked means), comparable across runs
+    def masked_mean(loss, loss_mask):
+        return jnp.sum(jnp.where(loss_mask > 0, loss, 0.0)) / jnp.maximum(
+            jnp.sum(loss_mask), 1.0
+        )
+
+    unroll_diagnostics = {
+        "policy_loss_k0": masked_mean(policy_loss[:1], mask[:1]),
+        "policy_loss_k1plus": masked_mean(policy_loss[1:], mask[1:]),
+        "value_loss_k0": masked_mean(v_loss[:1], unroll_mask[:1]),
+        "value_loss_k1plus": masked_mean(v_loss[1:], unroll_mask[1:]),
+    }
+
     consistency_loss = jnp.mean(consistency_loss, where=mask)
-    policy_loss = jnp.mean(policy_loss, where=mask)
-    v_loss = jnp.mean(v_loss, where=unroll_mask)
+    policy_loss = weighted_masked_mean(policy_loss, mask, step_weights)
+    v_loss = weighted_masked_mean(v_loss, unroll_mask, step_weights)
     dynamics_loss = jnp.mean(dynamics_loss, where=unroll_mask)
+    # ### END BOTTOM-UP STEP 2c ##############################################
     total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty  # + consistency_loss
 
     metrics = {
@@ -1714,6 +1764,7 @@ def compute_muzero_loss(
         "dynamics_loss": dynamics_loss,
         "consistency_loss": consistency_loss,
         "l2_penalty": l2_penalty,
+        **unroll_diagnostics,  # ### BOTTOM-UP STEP 2c
         # 'entropy': entropy,
         # 'approx_kl': jax.lax.stop_gradient(approx_kl),
     }
