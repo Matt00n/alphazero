@@ -117,7 +117,7 @@ class Config:
     per_importance_sampling_beta: float = 1.0
 
     # algorithm hyperparameters
-    total_timesteps = int(1e7)
+    total_timesteps = int(1e6)
     learning_rate = 1e-3  # 3e-4
     unroll_length = 128  # 512 # 128
     anneal_lr = True
@@ -827,6 +827,10 @@ def scalar_untransform(y: jnp.ndarray, eps: float = 1e-3) -> jnp.ndarray:
 
 
 def logits_to_scalar_expectation(logits: jnp.ndarray, eps: float = 1e-3) -> jnp.ndarray:
+    # NOTE: this decoding (E[φ^{-1}(i)]) does not match the two-hot encoding;
+    # the paper-consistent φ^{-1}(E[i]) is in muzero_ablate.py. Not ported here:
+    # on seed 20 it made full MuZero collapse early (eval -500 up to ~60k steps,
+    # policy loss ~0.3), while this version learns.
     # Convert 601-way logits to scalar by E[φ^{-1}(i)]
     probs = jax.nn.softmax(logits, axis=-1)
     n = logits.shape[-1]
@@ -881,15 +885,30 @@ def n_step_bootstrapped_targets(
 
     # Pad sequences. Shape is now (T + n - 1, ...).
     rewards = jnp.concatenate([rewards, jnp.zeros((n - 1,) + batch_shape[1:])])
-    discounts = (
-        jnp.concatenate([discounts, jnp.ones((n - 1,) + batch_shape[1:])]) * gamma
+    # ######################################################################
+    # ### FIX (PORTED FROM muzero_ablate): padded steps past the end of the
+    # ### sequence must have discount 1 (no time passes there), not gamma.
+    # ### Previously the last n-1 steps of every unroll bootstrapped V(s_T)
+    # ### with gamma^n instead of gamma^(T-t). Active since use_gae=False.
+    # ### Old:
+    # # discounts = (
+    # #     jnp.concatenate([discounts, jnp.ones((n - 1,) + batch_shape[1:])]) * gamma
+    # # )
+    # # ...
+    # # bootstrap_discounts = (
+    # #     jnp.concatenate([termination_discount, jnp.ones((n - 1,) + batch_shape[1:])])
+    # #     * gamma
+    # # )
+    # ######################################################################
+    discounts = jnp.concatenate(
+        [discounts * gamma, jnp.ones((n - 1,) + batch_shape[1:])]
     )
 
     value_prefix_targets = jax.lax.dynamic_slice_in_dim(rewards, n - 1, seq_len)
-    bootstrap_discounts = (
-        jnp.concatenate([termination_discount, jnp.ones((n - 1,) + batch_shape[1:])])
-        * gamma
+    bootstrap_discounts = jnp.concatenate(
+        [termination_discount * gamma, jnp.ones((n - 1,) + batch_shape[1:])]
     )
+    # ### END FIX ############################################################
     bootstrap_discounts = jax.lax.dynamic_slice_in_dim(
         bootstrap_discounts, n - 1, seq_len
     )

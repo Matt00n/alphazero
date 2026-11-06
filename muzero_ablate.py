@@ -111,7 +111,18 @@ class Config:
     #        (MuZero Appendix F), i.e. the previous behaviour.
     categorical_value: bool = False
 
-    loss_unroll_length: int = 1  # TODO Oracle test, reset to 5
+    # ### BOTTOM-UP STEP 1: learned representation (search "BOTTOM-UP STEP 1") ###
+    # True:  real representation MLP -> embedding_size, search still on true env.
+    # False: oracle test, representation = normalized observation (previous runs).
+    learned_representation: bool = True
+
+    loss_unroll_length: int = 5  # TODO Oracle test, reset to 5
+
+    # ### BOTTOM-UP STEP 2b: MuZero gradient scaling (search "BOTTOM-UP STEP 2b") ###
+    # Gradient through each recurrent hidden state fed into the next dynamics call
+    # is scaled by this factor (MuZero pseudocode: scale_gradient(hidden_state, 0.5)).
+    # 1.0 = off (previous behaviour, exact identity).
+    dynamics_gradient_scale: float = 0.5
 
     # reanalyze
     reanalyze: bool = False
@@ -376,15 +387,35 @@ def make_az_networks(
         parametric_action_distribution = PolicyNormalDistribution(
             event_size=action_size
         )
-    representation_network = make_tmp_representation_function(
-        obs_size=observation_size,
-        embedding_dim=embedding_size,
-        preprocess_observation_fn=preprocess_observation_fn,
-        hidden_layer_sizes=representation_hidden_layer_sizes,
-        activation=activation,
-    )
+    # ######################################################################
+    # ### BOTTOM-UP STEP 1: learned representation (Config.learned_representation)
+    # ### True  -> real MLP representation network (64-dim, LayerNorm output);
+    # ###          policy / value / dynamics operate on the embedding.
+    # ### False -> previous oracle test: representation = normalized observation.
+    # ### MCTS still runs on the TRUE environment (see actor_step), leaf
+    # ### embeddings are representation_fn(true next observation).
+    # ######################################################################
+    if Config.learned_representation:
+        representation_network = make_representation_function(
+            obs_size=observation_size,
+            embedding_dim=embedding_size,
+            preprocess_observation_fn=preprocess_observation_fn,
+            hidden_layer_sizes=representation_hidden_layer_sizes,
+            activation=activation,
+        )
+        hidden_size = (embedding_size,)
+    else:
+        representation_network = make_tmp_representation_function(
+            obs_size=observation_size,
+            embedding_dim=embedding_size,
+            preprocess_observation_fn=preprocess_observation_fn,
+            hidden_layer_sizes=representation_hidden_layer_sizes,
+            activation=activation,
+        )
+        hidden_size = observation_size
+    # ### END BOTTOM-UP STEP 1 (hidden_size is used below) #####################
     dynamics_network = make_dynamics_network(
-        embedding_size=observation_size[0],  # embedding_size, # TODO oracle test, undo
+        embedding_size=hidden_size[0],  # ### BOTTOM-UP STEP 1, was: observation_size[0]
         num_actions=action_size,
         num_reward_atoms=601,  # TODO get as input
         preprocess_observation_fn=lambda x, y: x,
@@ -394,13 +425,13 @@ def make_az_networks(
     )
     policy_network = make_policy_network(
         parametric_action_distribution.param_size,
-        observation_size,  # (embedding_size,), # TODO oracle test, undo
+        hidden_size,  # ### BOTTOM-UP STEP 1, was: observation_size
         preprocess_observation_fn=lambda x, y: x,
         hidden_layer_sizes=policy_hidden_layer_sizes,
         activation=activation,
     )
     value_network = make_value_network(
-        observation_size,  # (embedding_size,),
+        hidden_size,  # ### BOTTOM-UP STEP 1, was: observation_size
         # ### ABLATION STEP: scalar value head (see Config.categorical_value)
         num_atoms=601 if Config.categorical_value else 1,  # was: 601  # value test
         preprocess_observation_fn=lambda x, y: x,
@@ -1419,10 +1450,26 @@ def compute_muzero_loss(
     hidden = representation_apply(normalizer_params, params.representation, hidden)
 
     # scan loss over K unroll steps of dynamics model
+    # ######################################################################
+    # ### BOTTOM-UP STEP 2b: MuZero gradient scaling (Config.dynamics_gradient_scale)
+    # ### MuZero pseudocode (train_network / update_weights):
+    # ###   for action in actions:
+    # ###       ..., hidden_state = network.recurrent_inference(hidden_state, action)
+    # ###       hidden_state = scale_gradient(hidden_state, 0.5)
+    # ### i.e. the representation output (k=0) enters the first dynamics call
+    # ### unscaled; every later recurrent hidden state is scaled before it enters
+    # ### the next dynamics call. The heads always see the unscaled hidden state.
+    # ### Forward values are unchanged, only gradients are scaled.
+    # ######################################################################
+    def scale_gradient(x: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
+        return x * scale + jax.lax.stop_gradient(x) * (1.0 - scale)
+
     def unroll_loss(
-        hidden_states: jnp.ndarray,
+        carry: Tuple[jnp.ndarray, jnp.ndarray],
         targets_actions_mask: Any,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], Any]:
+        # ### BOTTOM-UP STEP 2b: carry = (hidden state, gradient scale for dynamics input)
+        hidden_states, dynamics_input_grad_scale = carry
         (
             observations,
             policy_targets,
@@ -1442,7 +1489,11 @@ def compute_muzero_loss(
         policy_logits = policy_apply(jnp.zeros(1), params.policy, hidden_states)
         baseline = value_apply(jnp.zeros(1), params.value, hidden_states)
         model_reward, n_hidden_state = dynamics_apply(
-            jnp.zeros(1), params.dynamics, hidden_states, actions
+            jnp.zeros(1),
+            params.dynamics,
+            # ### BOTTOM-UP STEP 2b, was: hidden_states
+            scale_gradient(hidden_states, dynamics_input_grad_scale),
+            actions,
         )
 
         # policy loss
@@ -1539,7 +1590,16 @@ def compute_muzero_loss(
         # policy_loss *= loss_mask
         # v_loss *= loss_mask
         # dynamics_loss *= loss_mask
-        return n_hidden_state, (policy_loss, v_loss, dynamics_loss, consistency_loss)
+        # ### BOTTOM-UP STEP 2b: all later dynamics inputs get the configured scale
+        next_grad_scale = jnp.full_like(
+            dynamics_input_grad_scale, Config.dynamics_gradient_scale
+        )
+        return (n_hidden_state, next_grad_scale), (
+            policy_loss,
+            v_loss,
+            dynamics_loss,
+            consistency_loss,
+        )
 
     chex.assert_shape(
         data.bootstrap_values,
@@ -1565,8 +1625,13 @@ def compute_muzero_loss(
     # jax.debug.print('targets: {x}', x=targets)
 
     _, (policy_loss, v_loss, dynamics_loss, consistency_loss) = jax.lax.scan(
-        unroll_loss, hidden, targets, length=num_unroll_steps
+        unroll_loss,
+        # ### BOTTOM-UP STEP 2b: first dynamics call (on representation output) unscaled
+        (hidden, jnp.ones((), dtype=hidden.dtype)),
+        targets,
+        length=num_unroll_steps,
     )
+    # ### END BOTTOM-UP STEP 2b ##################################################
 
     # jax.debug.print('policy_loss: {x}', x=policy_loss.shape)
     # jax.debug.print('v_loss: {x}', x=v_loss.shape)
