@@ -130,6 +130,19 @@ class Config:
     # False: uniform mean over unroll steps (previous behaviour).
     muzero_loss_weighting: bool = True
 
+    # ### BOTTOM-UP STEP 3: learned dynamics in search (search "BOTTOM-UP STEP 3") ###
+    # True:  full MuZero search on the learned model (representation + dynamics).
+    # False: oracle test, MCTS on the true environment (previous runs).
+    # Also logs search diagnostics: training/search_entropy, search_prior_entropy,
+    # search_root_q_spread (always, also with the oracle search).
+    learned_dynamics_search: bool = True
+
+    # ### BOTTOM-UP STEP 3b: consistency loss (search "BOTTOM-UP STEP 3b") ###
+    # Weight of -cos(predicted embedding, stop_grad(representation(real obs)))
+    # for unroll steps k >= 1 in the total loss (EfficientZero uses 2.0, there
+    # with an extra projection/prediction head). 0.0 = off (previous behaviour).
+    consistency_loss_coef: float = 2.0
+
     # reanalyze
     reanalyze: bool = False
 
@@ -509,41 +522,80 @@ def actor_step(
 
     ################################
 
-    # # TODO: AlphaZero style for oracle test, remove again
-    root = mctx.RootFnOutput(
-        prior_logits=prior_logits,
-        value=value,
-        # The embedding is used only to implement the MuZero model.
-        embedding=env_state,
-    )
-
-    def recurrent_fn(params, rng_key, action, embedding):
-        # environment (model)
-        env_state = embedding
-        nstate = rollout_env.step(env_state, action)
-
-        # policy & value networks
-        embedding = representation_fn(nstate.obs)
-        prior_logits, value = forward(embedding)  # priorly: env_state
-
-        # Create the new MCTS node.
-        recurrent_fn_output = mctx.RecurrentFnOutput(
-            reward=nstate.reward,
-            # discount when terminal state reached
-            discount=Config.n_step_gamma
-            * jnp.where(
-                nstate.info["truncation"], jnp.ones_like(nstate.done), 1 - nstate.done
-            ),  # 1 - nstate.done,
-            # prior for the new state
+    # ######################################################################
+    # ### BOTTOM-UP STEP 3: learned dynamics in search (Config.learned_dynamics_search)
+    # ### True  -> full MuZero search: root embedding = representation(obs),
+    # ###          leaves via the learned dynamics network (reward decoded with
+    # ###          the paper-consistent decoding), discount = gamma everywhere
+    # ###          (the model has no terminal signal; as in the original code).
+    # ### False -> previous oracle test: search runs on the TRUE environment.
+    # ######################################################################
+    if Config.learned_dynamics_search:
+        root = mctx.RootFnOutput(
             prior_logits=prior_logits,
-            # value for the new state
             value=value,
+            embedding=root_embedding,
         )
 
-        # Return the new node and the new environment.
-        return recurrent_fn_output, nstate
+        def recurrent_fn(params, rng_key, action, embedding):
+            # environment (model)
+            reward, nstate = dynamics_fn(embedding, action)
 
-    ################################
+            # policy & value networks
+            prior_logits, value = forward(nstate)
+
+            # Create the new MCTS node.
+            recurrent_fn_output = mctx.RecurrentFnOutput(
+                reward=reward,
+                # no terminal prediction: constant discount
+                discount=Config.n_step_gamma * jnp.ones_like(reward),
+                # prior for the new state
+                prior_logits=prior_logits,
+                # value for the new state
+                value=value,
+            )
+
+            # Return the new node and the new hidden state.
+            return recurrent_fn_output, nstate
+
+    else:
+        # # TODO: AlphaZero style for oracle test, remove again
+        root = mctx.RootFnOutput(
+            prior_logits=prior_logits,
+            value=value,
+            # The embedding is used only to implement the MuZero model.
+            embedding=env_state,
+        )
+
+        def recurrent_fn(params, rng_key, action, embedding):
+            # environment (model)
+            env_state = embedding
+            nstate = rollout_env.step(env_state, action)
+
+            # policy & value networks
+            embedding = representation_fn(nstate.obs)
+            prior_logits, value = forward(embedding)  # priorly: env_state
+
+            # Create the new MCTS node.
+            recurrent_fn_output = mctx.RecurrentFnOutput(
+                reward=nstate.reward,
+                # discount when terminal state reached
+                discount=Config.n_step_gamma
+                * jnp.where(
+                    nstate.info["truncation"],
+                    jnp.ones_like(nstate.done),
+                    1 - nstate.done,
+                ),  # 1 - nstate.done,
+                # prior for the new state
+                prior_logits=prior_logits,
+                # value for the new state
+                value=value,
+            )
+
+            # Return the new node and the new environment.
+            return recurrent_fn_output, nstate
+
+    # ### END BOTTOM-UP STEP 3 ###############################################
 
     # Running the search.
     # policy_output = mctx.gumbel_muzero_policy(
@@ -582,9 +634,31 @@ def actor_step(
     search_value = policy_output.search_tree.summary().value
     # search_value = policy_output.search_tree.summary().qvalues[jnp.arange(actions.shape[0]), actions, :]
 
+    # ######################################################################
+    # ### BOTTOM-UP STEP 3: search diagnostics (logged as training/search_*)
+    # ### search_entropy: entropy of the search policy (action_weights)
+    # ### prior_entropy:  entropy of the prior policy at the root
+    # ### root_q_spread:  max - min root Q over visited actions
+    # ######################################################################
+    root_visit_counts = policy_output.search_tree.summary().visit_counts
+    visited = root_visit_counts > 0
+    search_entropy = -jnp.sum(
+        jnp.where(action_weights > 0, action_weights * jnp.log(action_weights), 0.0),
+        axis=-1,
+    )
+    prior_entropy = tfd.Categorical(logits=prior_logits).entropy()
+    root_q_spread = jnp.max(
+        jnp.where(visited, qvalues, -jnp.inf), axis=-1
+    ) - jnp.min(jnp.where(visited, qvalues, jnp.inf), axis=-1)
+    # ### END BOTTOM-UP STEP 3 diagnostics #####################################
+
     policy_extras = {
         "prior_log_prob": tfd.Categorical(logits=prior_logits).log_prob(actions),
         "raw_action": actions,
+        # ### BOTTOM-UP STEP 3: search diagnostics
+        "search_entropy": search_entropy,
+        "prior_entropy": prior_entropy,
+        "root_q_spread": root_q_spread,
     }
 
     nstate = env.step(env_state, actions)
@@ -1750,12 +1824,26 @@ def compute_muzero_loss(
         "value_loss_k1plus": masked_mean(v_loss[1:], unroll_mask[1:]),
     }
 
+    # ### BOTTOM-UP STEP 3b: consistency loss on recurrent steps only. At k=0 the
+    # ### predicted and target embedding are identical (-cos = -1, zero gradient),
+    # ### so including k=0 would only dilute the coefficient.
+    consistency_loss_k1plus = masked_mean(consistency_loss[1:], mask[1:])
+
     consistency_loss = jnp.mean(consistency_loss, where=mask)
     policy_loss = weighted_masked_mean(policy_loss, mask, step_weights)
     v_loss = weighted_masked_mean(v_loss, unroll_mask, step_weights)
     dynamics_loss = jnp.mean(dynamics_loss, where=unroll_mask)
     # ### END BOTTOM-UP STEP 2c ##############################################
     total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty  # + consistency_loss
+    # ######################################################################
+    # ### BOTTOM-UP STEP 3b: consistency loss in the total (Config.consistency_loss_coef)
+    # ### -cos(predicted embedding at k, stop_grad(representation(real obs at k))),
+    # ### k >= 1, masked after terminals. Gradient flows into dynamics (and via
+    # ### the unroll into the representation), not into the target branch.
+    # ### Old: total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty
+    # ######################################################################
+    total_loss = total_loss + Config.consistency_loss_coef * consistency_loss_k1plus
+    # ### END BOTTOM-UP STEP 3b ##############################################
 
     metrics = {
         "total_loss": total_loss,
@@ -1765,6 +1853,7 @@ def compute_muzero_loss(
         "consistency_loss": consistency_loss,
         "l2_penalty": l2_penalty,
         **unroll_diagnostics,  # ### BOTTOM-UP STEP 2c
+        "consistency_loss_k1plus": consistency_loss_k1plus,  # ### BOTTOM-UP STEP 3b
         # 'entropy': entropy,
         # 'approx_kl': jax.lax.stop_gradient(approx_kl),
     }
@@ -1901,7 +1990,14 @@ def main(_):
             bootstrap_discount=0.0,
             extras={
                 "state_extras": {"truncation": 0.0},
-                "policy_extras": {"prior_log_prob": 0.0, "raw_action": 0.0},
+                "policy_extras": {
+                    "prior_log_prob": 0.0,
+                    "raw_action": 0.0,
+                    # ### BOTTOM-UP STEP 3: search diagnostics
+                    "search_entropy": 0.0,
+                    "prior_entropy": 0.0,
+                    "root_q_spread": 0.0,
+                },
             },
             priority=0.0,
             weight=0.0,
@@ -2163,6 +2259,17 @@ def main(_):
 
         assert data.discount.shape[0] == Config.unroll_length
 
+        # ### BOTTOM-UP STEP 3: search diagnostics from this unroll (acting time)
+        search_diagnostics = {
+            "search_entropy": jnp.mean(data.extras["policy_extras"]["search_entropy"]),
+            "search_prior_entropy": jnp.mean(
+                data.extras["policy_extras"]["prior_entropy"]
+            ),
+            "search_root_q_spread": jnp.mean(
+                data.extras["policy_extras"]["root_q_spread"]
+            ),
+        }
+
         (
             value_prefix_targets,
             bootstrap_observations,
@@ -2294,6 +2401,7 @@ def main(_):
         )
 
         metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
+        metrics.update(search_diagnostics)  # ### BOTTOM-UP STEP 3
         return (new_training_state, state, buffer_state, new_key), metrics
 
     def training_epoch(

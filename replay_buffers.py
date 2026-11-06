@@ -301,6 +301,28 @@ class PrioritizedSamplingQueue(QueueBase[Sample], Generic[Sample]):
         )
         self.per_importance_sampling_beta = per_importance_sampling_beta
 
+        # ######################################################################
+        # ### FIX: locate the flattened columns of the `priority` and `weight`
+        # ### fields instead of assuming they are the last two columns (-2, -1).
+        # ### That assumption holds for MCTSTransition (alphazero.py, unchanged
+        # ### columns) but not for MuZeroTransition, whose unroll fields come
+        # ### after priority/weight: there columns -2/-1 are terminal_mask[U-2]
+        # ### and terminal_mask[U-1], so sampling probabilities were read from
+        # ### (and written into) the terminal mask.
+        # ######################################################################
+        def _column_of(field: str) -> int:
+            marker = jax.tree_util.tree_map(jnp.zeros_like, dummy_data_sample)
+            marker = marker._replace(
+                **{field: jnp.ones_like(getattr(marker, field))})
+            flat = flatten_util.ravel_pytree(marker)[0]
+            columns = jnp.nonzero(flat)[0]
+            assert columns.shape == (1,), f'`{field}` must be a scalar per sample'
+            return int(columns[0])
+
+        self._priority_column = _column_of('priority')
+        self._weight_column = _column_of('weight')
+        # ### END FIX ############################################################
+
     def sample_internal(
         self, buffer_state: ReplayBufferState
     ) -> Tuple[ReplayBufferState, Sample]:
@@ -315,7 +337,7 @@ class PrioritizedSamplingQueue(QueueBase[Sample], Generic[Sample]):
         data = buffer_state.data
         indices = jnp.arange(len(data))
         probs = jnp.where(indices < buffer_state.insert_position, 
-                          data[:, -2], 0.) 
+                          data[:, self._priority_column], 0.)  # FIX, was: data[:, -2]
         probs /= jnp.sum(probs)
         idx = jax.random.choice(
             sample_key,
@@ -329,14 +351,16 @@ class PrioritizedSamplingQueue(QueueBase[Sample], Generic[Sample]):
         loss_weights = 1.0 / (buffer_state.insert_position * probs + 1e-10)**self.per_importance_sampling_beta
         loss_weights /= jnp.max(loss_weights)
 
-        buffer_state = buffer_state.replace(data=buffer_state.data.at[:, -1].set(loss_weights))
+        # FIX, was: .at[:, -1]
+        buffer_state = buffer_state.replace(data=buffer_state.data.at[:, self._weight_column].set(loss_weights))
 
         batch = jnp.take(buffer_state.data, idx, axis=0, mode='wrap')
         return buffer_state.replace(key=key, current_sample_indices=idx), self._unflatten_fn(batch)
     
     def set_priorities(self, buffer_state: ReplayBufferState, priorities: jnp.ndarray):
         idx = buffer_state.current_sample_indices
-        return buffer_state.replace(data=buffer_state.data.at[idx, -2].set(priorities))
+        # FIX, was: .at[idx, -2]
+        return buffer_state.replace(data=buffer_state.data.at[idx, self._priority_column].set(priorities))
 
 
 class PmapWrapper(ReplayBuffer[State, Sample]):
