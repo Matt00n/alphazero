@@ -69,7 +69,7 @@ from networks.policy import BaseDynamicsFn, BaseRepresentationFn, ForwardPass, P
 class Config:
     # experiment
     experiment_name = "base_short"
-    seed = 20
+    seed = 22
     platform = "cpu"  # CPU or GPU
     capture_video = False
     write_logs_to_file = False
@@ -142,6 +142,11 @@ class Config:
     # for unroll steps k >= 1 in the total loss (EfficientZero uses 2.0, there
     # with an extra projection/prediction head). 0.0 = off (previous behaviour).
     consistency_loss_coef: float = 2.0
+
+    # ### DUAL EVAL (search "DUAL EVAL") ###
+    # True: additionally evaluate with the most visited root action and no root
+    # Dirichlet noise (MuZero-style), logged as eval_visits/*. Training unchanged.
+    dual_eval_visit_counts: bool = True
 
     # reanalyze
     reanalyze: bool = False
@@ -477,6 +482,7 @@ def actor_step(
     key: jnp.ndarray,
     deterministic_actions: bool = False,
     extra_fields: Sequence[str] = (),
+    visit_count_actions: bool = False,  # ### DUAL EVAL (see Config.dual_eval_visit_counts)
 ) -> Tuple[State, MuZeroTransition]:
     """Collect data."""
 
@@ -616,7 +622,8 @@ def actor_step(
         root=root,
         recurrent_fn=recurrent_fn,
         num_simulations=Config.num_simulations,
-        dirichlet_fraction=0.25,
+        # ### DUAL EVAL: no root Dirichlet noise for the visit-count evaluator
+        dirichlet_fraction=0.0 if visit_count_actions else 0.25,
         dirichlet_alpha=0.3,
         pb_c_init=1.25,  # 1.25,
         pb_c_base=19652,  # 19652,
@@ -628,7 +635,12 @@ def actor_step(
     # best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
     qvalues = jnp.mean(policy_output.search_tree.summary().qvalues, axis=-1)
     masked_qvalues = jnp.where(action_weights, qvalues, -jnp.inf)
-    best_actions = jnp.argmax(masked_qvalues, axis=-1).astype(jnp.int32)
+    # ### DUAL EVAL: deterministic action = most visited root action (MuZero)
+    # ### instead of argmax Q over visited actions
+    if visit_count_actions:
+        best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
+    else:
+        best_actions = jnp.argmax(masked_qvalues, axis=-1).astype(jnp.int32)
     actions = jax.lax.select(deterministic_actions, best_actions, actions)
 
     search_value = policy_output.search_tree.summary().value
@@ -647,9 +659,9 @@ def actor_step(
         axis=-1,
     )
     prior_entropy = tfd.Categorical(logits=prior_logits).entropy()
-    root_q_spread = jnp.max(
-        jnp.where(visited, qvalues, -jnp.inf), axis=-1
-    ) - jnp.min(jnp.where(visited, qvalues, jnp.inf), axis=-1)
+    root_q_spread = jnp.max(jnp.where(visited, qvalues, -jnp.inf), axis=-1) - jnp.min(
+        jnp.where(visited, qvalues, jnp.inf), axis=-1
+    )
     # ### END BOTTOM-UP STEP 3 diagnostics #####################################
 
     policy_extras = {
@@ -719,6 +731,7 @@ def generate_unroll(
     unroll_length: int,
     deterministic_actions: bool = False,
     extra_fields: Sequence[str] = (),
+    visit_count_actions: bool = False,  # ### DUAL EVAL
 ) -> Tuple[State, MuZeroTransition]:
     """Collect trajectories of given unroll_length."""
 
@@ -736,6 +749,7 @@ def generate_unroll(
             current_key,
             deterministic_actions=deterministic_actions,
             extra_fields=extra_fields,
+            visit_count_actions=visit_count_actions,  # ### DUAL EVAL
         )
         return (nstate, next_key), transition
 
@@ -758,6 +772,7 @@ class Evaluator:
         action_repeat: int,
         key: jnp.ndarray,
         deterministic_eval: bool = True,
+        visit_count_actions: bool = False,  # ### DUAL EVAL
     ):
         """Init.
 
@@ -805,6 +820,7 @@ class Evaluator:
                 key,
                 unroll_length=episode_length // action_repeat,
                 deterministic_actions=deterministic_eval,
+                visit_count_actions=visit_count_actions,  # ### DUAL EVAL
             )[0]
 
         self._generate_eval_unroll = jax.jit(generate_eval_unroll)
@@ -1146,6 +1162,26 @@ def compute_gae(
     )
 
 
+# ##########################################################################
+# ### TRUNCATION FIX: the env wrapper sets done = 1 both on real termination
+# ### and on truncation (time limit), and transitions store discount = 1 - done.
+# ### Previously all targets treated truncation like termination (absorbing,
+# ### no bootstrap). This splits the two signals.
+# ##########################################################################
+def split_termination_truncation(
+    discount: jnp.ndarray, truncation: jnp.ndarray
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Returns (termination, truncation) flags from discount = 1 - done.
+
+    termination: episode really ended (absorbing state, value 0 afterwards).
+    truncation: episode was cut by the time limit (bootstrap, no absorbing state).
+    """
+    done = 1.0 - discount
+    truncation = done * truncation  # truncation flag only counts on done steps
+    termination = done * (1.0 - truncation)
+    return termination, truncation
+
+
 def collect_targets(
     targets: Tuple[
         jnp.ndarray,
@@ -1159,6 +1195,7 @@ def collect_targets(
     ],
     done: jnp.ndarray,
     unroll_steps: int = 5,
+    truncation: Optional[jnp.ndarray] = None,  # ### TRUNCATION FIX
 ) -> Tuple[
     jnp.ndarray,
     jnp.ndarray,
@@ -1231,6 +1268,25 @@ def collect_targets(
 
     # Expand mask to match full shape [T, B, U, ...]
     mask = jnp.broadcast_to(mask, (T, B, unroll_steps) + done.shape[2:])
+
+    # ### TRUNCATION FIX: unroll steps after a truncation inside the window belong
+    # ### to the next episode (auto-reset) and have no valid target -> mask them
+    # ### out of all losses (instead of treating them as an absorbing state).
+    # ### `done` passed in here is the real termination only.
+    if truncation is not None:
+        truncation = truncation[..., 0] if truncation.ndim == 3 else truncation
+        is_trunc_in_window = create_time_sliced_array(truncation)  # [T, B, U]
+        not_trunc_before = jnp.cumprod(
+            jnp.concatenate(
+                [
+                    jnp.ones_like(is_trunc_in_window[:, :, :1]),
+                    1.0 - is_trunc_in_window[:, :, :-1],
+                ],
+                axis=2,
+            ),
+            axis=2,
+        )
+        mask = mask * not_trunc_before
 
     # --- Apply `done` masking ---
     # Expand `done` for broadcasting: [T, B, U]
@@ -1807,9 +1863,7 @@ def compute_muzero_loss(
 
     def weighted_masked_mean(loss, loss_mask, weights):
         w = weights * loss_mask
-        return jnp.sum(jnp.where(w > 0, loss * w, 0.0)) / jnp.maximum(
-            jnp.sum(w), 1e-8
-        )
+        return jnp.sum(jnp.where(w > 0, loss * w, 0.0)) / jnp.maximum(jnp.sum(w), 1e-8)
 
     # per-k diagnostics (unweighted masked means), comparable across runs
     def masked_mean(loss, loss_mask):
@@ -2259,6 +2313,11 @@ def main(_):
 
         assert data.discount.shape[0] == Config.unroll_length
 
+        # ### TRUNCATION FIX: split done into real termination and truncation
+        termination, truncation = split_termination_truncation(
+            data.discount, data.extras["state_extras"]["truncation"]
+        )
+
         # ### BOTTOM-UP STEP 3: search diagnostics from this unroll (acting time)
         search_diagnostics = {
             "search_entropy": jnp.mean(data.extras["policy_extras"]["search_entropy"]),
@@ -2278,7 +2337,10 @@ def main(_):
         ) = n_step_fn(
             rewards=data.reward,
             discounts=data.discount * (1 - data.extras["state_extras"]["truncation"]),
-            termination_discount=data.discount,
+            # ### TRUNCATION FIX, was: termination_discount=data.discount
+            # ### (truncation counted as termination -> no bootstrap). Now GAE
+            # ### sees truncation separately and only cuts the lambda-chain there.
+            termination_discount=1.0 - termination,
             observations=data.next_observation,
             values=jnp.concatenate(
                 [data.search_value, jnp.array([transition.search_value])]
@@ -2327,7 +2389,13 @@ def main(_):
             unroll_actions,
             unroll_mask,
             terminal_mask,
-        ) = collect_targets(targets, 1 - data.discount, Config.loss_unroll_length)
+        ) = collect_targets(
+            targets,
+            # ### TRUNCATION FIX, was: 1 - data.discount (termination OR truncation)
+            termination,
+            Config.loss_unroll_length,
+            truncation=truncation,
+        )
 
         data = data._replace(
             unroll_obs=unroll_obs,
@@ -2517,6 +2585,11 @@ def main(_):
 
         assert data.discount.shape[0] == num_prefill_actor_steps
 
+        # ### TRUNCATION FIX: split done into real termination and truncation
+        termination, truncation = split_termination_truncation(
+            data.discount, data.extras["state_extras"]["truncation"]
+        )
+
         (
             value_prefix_targets,
             bootstrap_observations,
@@ -2525,7 +2598,10 @@ def main(_):
         ) = n_step_fn(
             rewards=data.reward,
             discounts=data.discount * (1 - data.extras["state_extras"]["truncation"]),
-            termination_discount=data.discount,
+            # ### TRUNCATION FIX, was: termination_discount=data.discount
+            # ### (truncation counted as termination -> no bootstrap). Now GAE
+            # ### sees truncation separately and only cuts the lambda-chain there.
+            termination_discount=1.0 - termination,
             observations=data.next_observation,
             values=jnp.concatenate(
                 [data.search_value, jnp.array([transition.search_value])]
@@ -2574,7 +2650,13 @@ def main(_):
             unroll_actions,
             unroll_mask,
             terminal_mask,
-        ) = collect_targets(targets, 1 - data.discount, Config.loss_unroll_length)
+        ) = collect_targets(
+            targets,
+            # ### TRUNCATION FIX, was: 1 - data.discount (termination OR truncation)
+            termination,
+            Config.loss_unroll_length,
+            truncation=truncation,
+        )
 
         data = data._replace(
             unroll_obs=unroll_obs,
@@ -2687,10 +2769,49 @@ def main(_):
         deterministic_eval=Config.deterministic_eval,
     )
 
+    # ######################################################################
+    # ### DUAL EVAL (Config.dual_eval_visit_counts): second evaluator that picks
+    # ### the most visited root action and uses no root Dirichlet noise. Same
+    # ### eval_key -> both evaluators play the same start states each eval.
+    # ### Logged as eval_visits/*; eval/* is unchanged (argmax Q, with noise).
+    # ######################################################################
+    evaluator_visits = None
+    if Config.dual_eval_visit_counts:
+        evaluator_visits = Evaluator(
+            eval_env,
+            model_rollout_env,
+            make_forward,
+            make_representation,
+            make_dynamics,
+            num_eval_envs=Config.num_eval_envs,
+            episode_length=Config.episode_length,
+            action_repeat=Config.action_repeat,
+            key=eval_key,
+            deterministic_eval=Config.deterministic_eval,
+            visit_count_actions=True,
+        )
+
+    def run_evaluations(policy_params):
+        metrics = evaluator.run_evaluation(policy_params, training_metrics={})
+        if evaluator_visits is not None:
+            visit_metrics = evaluator_visits.run_evaluation(
+                policy_params, training_metrics={}
+            )
+            metrics.update(
+                {
+                    k.replace("eval/", "eval_visits/", 1): v
+                    for k, v in visit_metrics.items()
+                    if k.startswith("eval/")
+                }
+            )
+        return metrics
+
+    # ### END DUAL EVAL ######################################################
+
     # Run initial eval
     metrics = {}
     if process_id == 0 and eval_env:
-        metrics = evaluator.run_evaluation(
+        metrics = run_evaluations(  # ### DUAL EVAL, was: evaluator.run_evaluation
             _unpmap(
                 (
                     training_state.normalizer_params,
@@ -2701,7 +2822,6 @@ def main(_):
                     training_state.params.dynamics,
                 )
             ),
-            training_metrics={},
         )
         logging.info(metrics)
         # progress_fn(0, metrics)
@@ -2816,7 +2936,7 @@ def main(_):
 
         if process_id == 0:
             # Run evals.
-            metrics = evaluator.run_evaluation(
+            metrics = run_evaluations(  # ### DUAL EVAL, was: evaluator.run_evaluation
                 _unpmap(
                     (
                         training_state.normalizer_params,
@@ -2827,7 +2947,6 @@ def main(_):
                         training_state.params.dynamics,
                     )
                 ),
-                training_metrics={},
             )
 
             # record scores
