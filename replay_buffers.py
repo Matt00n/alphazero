@@ -347,14 +347,28 @@ class PrioritizedSamplingQueue(QueueBase[Sample], Generic[Sample]):
             p=probs,
         )
 
-        # update weights
-        loss_weights = 1.0 / (buffer_state.insert_position * probs + 1e-10)**self.per_importance_sampling_beta
+        # ######################################################################
+        # ### PER FIX: importance-sampling weights for the SAMPLED transitions,
+        # ### normalised by their max within the sample (Schaul et al. 2016;
+        # ### EfficientZero). Previously the weights were normalised by the max
+        # ### over the WHOLE buffer: a single near-zero priority (priority eps
+        # ### 1e-10) then got an astronomically large weight and pushed all other
+        # ### weights to ~0. With uniform priorities (per_alpha = 0) all weights
+        # ### are exactly 1, as before.
+        # ### Old:
+        # # loss_weights = 1.0 / (buffer_state.insert_position * probs + 1e-10)**beta
+        # # loss_weights /= jnp.max(loss_weights)
+        # # buffer_state = buffer_state.replace(
+        # #     data=buffer_state.data.at[:, self._weight_column].set(loss_weights))
+        # # batch = jnp.take(buffer_state.data, idx, axis=0, mode='wrap')
+        # ######################################################################
+        sample_probs = jnp.take(probs, idx, axis=0, mode='wrap')
+        loss_weights = 1.0 / (buffer_state.insert_position * sample_probs + 1e-10)**self.per_importance_sampling_beta
         loss_weights /= jnp.max(loss_weights)
 
-        # FIX, was: .at[:, -1]
-        buffer_state = buffer_state.replace(data=buffer_state.data.at[:, self._weight_column].set(loss_weights))
-
         batch = jnp.take(buffer_state.data, idx, axis=0, mode='wrap')
+        batch = batch.at[:, self._weight_column].set(loss_weights)
+        # ### END PER FIX ########################################################
         return buffer_state.replace(key=key, current_sample_indices=idx), self._unflatten_fn(batch)
     
     def set_priorities(self, buffer_state: ReplayBufferState, priorities: jnp.ndarray):
