@@ -116,7 +116,7 @@ class Config:
     # False: oracle test, representation = normalized observation (previous runs).
     learned_representation: bool = True
 
-    loss_unroll_length: int = 9  # TODO Oracle test, reset to 5
+    loss_unroll_length: int = 5  # was 9 in the last run (worse: -84); MuZero K=5 would be 6
 
     # ### BOTTOM-UP STEP 2b: MuZero gradient scaling (search "BOTTOM-UP STEP 2b") ###
     # Gradient through each recurrent hidden state fed into the next dynamics call
@@ -175,6 +175,11 @@ class Config:
     learning_rate = 1e-3  # 3e-4
     unroll_length = 128  # 512 # 128
     anneal_lr = True
+    # ### LR SCHEDULE FIX (search "LR SCHEDULE FIX"): True anneals the lr linearly
+    # ### over the actual number of optimizer updates (1e-3 -> 1e-5 by the end of
+    # ### training). False: previous behaviour (transition_steps = total_timesteps,
+    # ### i.e. only ~7% decay over a run).
+    anneal_lr_over_updates: bool = True
     num_minibatches = 128  # 64
     update_epochs = (
         1  # NOTE: no reason to increase this, just increase sample size instead
@@ -2422,12 +2427,37 @@ def main(_):
     make_representation = make_representation_fn(az_network)
     make_dynamics = make_dynamics_fn(az_network)
 
+    # ######################################################################
+    # ### LR SCHEDULE FIX (Config.anneal_lr_over_updates): optax schedules count
+    # ### OPTIMIZER UPDATES, not env steps. With transition_steps=total_timesteps
+    # ### (1e6) but only ~67.6k updates per run, the lr only decayed ~7% (to
+    # ### ~9.3e-4 instead of 1e-5). Now the schedule spans the actual number of
+    # ### updates: epochs x training steps per epoch x update_epochs x minibatches.
+    # ######################################################################
+    total_optimizer_updates = int(
+        num_evals_after_init
+        * num_training_steps_per_epoch
+        * max(Config.num_resets_per_eval, 1)
+        * Config.update_epochs
+        * Config.num_minibatches
+    )
+    lr_transition_steps = (
+        total_optimizer_updates
+        if Config.anneal_lr_over_updates
+        else Config.total_timesteps  # old behaviour
+    )
+    logging.info(
+        f"lr schedule: {total_optimizer_updates} optimizer updates in total, "
+        f"transition_steps = {lr_transition_steps}"
+    )
+    # ### END LR SCHEDULE FIX ##################################################
+
     # create optimizer
     if Config.anneal_lr:
         learning_rate = optax.linear_schedule(
             Config.learning_rate,
             Config.learning_rate * 0.01,  # 0
-            transition_steps=Config.total_timesteps,
+            transition_steps=lr_transition_steps,  # ### LR SCHEDULE FIX, was: Config.total_timesteps
         )
     else:
         learning_rate = Config.learning_rate
@@ -2773,6 +2803,16 @@ def main(_):
         )
 
         metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
+        # ### LR SCHEDULE FIX: log the lr used in this training step (the
+        # ### optimizer count = number of updates done so far)
+        if Config.anneal_lr:
+            updates_done = (
+                (training_state.env_steps - num_prefill_env_steps)
+                / env_step_per_training_step
+                * Config.update_epochs
+                * Config.num_minibatches
+            )
+            metrics["learning_rate"] = learning_rate(updates_done)
         metrics.update(search_diagnostics)  # ### BOTTOM-UP STEP 3
         return (new_training_state, state, buffer_state, new_key), metrics
 
