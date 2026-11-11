@@ -92,6 +92,9 @@ class Config:
     num_simulations = 30
     max_num_considered_actions = 16
     l2_coef = 1e-4  # 1e-4
+    # ### L2 FIX (search "L2 FIX"): True -> L2 only on weight matrices (kernels),
+    # ### not on biases / LayerNorm scale+bias. False -> previous (all params).
+    l2_exclude_bias_and_norm: bool = True
     vf_cost = 0.5
     # ### ABLATION STEP: AlphaZero value targets (see unroll_loss) ###
     use_gae = True  # was False; AlphaZero uses GAE over stored search values
@@ -116,7 +119,9 @@ class Config:
     # False: oracle test, representation = normalized observation (previous runs).
     learned_representation: bool = True
 
-    loss_unroll_length: int = 5  # was 9 in the last run (worse: -84); MuZero K=5 would be 6
+    loss_unroll_length: int = (
+        5  # was 9 in the last run (worse: -84); MuZero K=5 would be 6
+    )
 
     # ### BOTTOM-UP STEP 2b: MuZero gradient scaling (search "BOTTOM-UP STEP 2b") ###
     # Gradient through each recurrent hidden state fed into the next dynamics call
@@ -160,11 +165,11 @@ class Config:
 
     # replay buffer
     min_replay_size: int = 8192
-    max_replay_size: Optional[int] = 8192  # 8192 # 16384
+    max_replay_size: Optional[int] = 32768  # 8192 # 16384
     replay_buffer_batch_size: int = 128  # 256
-    per_alpha: float = 0.0
+    per_alpha: float = 1.0  # 0.0
     per_importance_sampling: bool = True
-    per_importance_sampling_beta: float = 1.0
+    per_importance_sampling_beta: float = 0.4  # 1.0
     # ### PER FIX: priority = (|value target - value| + per_epsilon) ** per_alpha
     # ### (was 1e-10 hard-coded; EfficientZero uses 1e-6). IS weights are now
     # ### normalised within the sampled batch and scale the WHOLE loss.
@@ -179,7 +184,7 @@ class Config:
     # ### over the actual number of optimizer updates (1e-3 -> 1e-5 by the end of
     # ### training). False: previous behaviour (transition_steps = total_timesteps,
     # ### i.e. only ~7% decay over a run).
-    anneal_lr_over_updates: bool = True
+    anneal_lr_over_updates: bool = False
     num_minibatches = 128  # 64
     update_epochs = (
         1  # NOTE: no reason to increase this, just increase sample size instead
@@ -187,10 +192,12 @@ class Config:
     max_grad_norm = 0.5
 
     # policy params
-    embedding_size: int = 64  # 64
+    embedding_size: int = 128  # 64
     policy_hidden_layer_sizes: Sequence[int] = (32,) * 4  # (32,) * 2  # (32,) * 4
     value_hidden_layer_sizes: Sequence[int] = (256,) * 5  # (256,) * 3  # (256,) * 5
-    representation_hidden_layer_sizes: Sequence[int] = (64,) * 2  # (32,) * 2
+    representation_hidden_layer_sizes: Sequence[int] = (
+        256,
+    ) * 2  # (64,) * 2 # (32,) * 2
     reward_hidden_layer_sizes: Sequence[int] = (64,) * 2  # (64,) * 2
     nstate_hidden_layer_sizes: Sequence[int] = (64,) * 2  # (64,) * 2
     activation: ActivationFn = nn.swish
@@ -1873,6 +1880,37 @@ def compute_muzero_loss(
 
     hidden = representation_apply(normalizer_params, params.representation, hidden)
 
+    # ######################################################################
+    # ### COLLAPSE DIAGNOSTIC: is the representation input-dependent? Metrics
+    # ### only (stop_gradient), computed on the root embeddings of this batch.
+    # ###   repr_pairwise_cosine  mean cosine between embeddings of DIFFERENT
+    # ###                         states; -> 1 when all embeddings are the same
+    # ###   repr_feature_std      per-feature std across the batch, averaged over
+    # ###                         features; -> 0 when collapsed
+    # ###   repr_layernorm_gain   mean |LayerNorm scale| of the representation
+    # ###                         network (L2 can pull it to 0 -> constant output)
+    # ######################################################################
+    h_sg = jax.lax.stop_gradient(hidden)
+    h_unit = h_sg / jnp.maximum(jnp.linalg.norm(h_sg, axis=-1, keepdims=True), 1e-8)
+    n_batch = h_unit.shape[0]
+    cos_matrix = h_unit @ h_unit.T
+    repr_pairwise_cosine = (jnp.sum(cos_matrix) - jnp.trace(cos_matrix)) / (
+        n_batch * (n_batch - 1)
+    )
+    repr_feature_std = jnp.mean(jnp.std(h_sg, axis=0))
+    layernorm_scales = [
+        jnp.abs(leaf).ravel()
+        for path, leaf in jax.tree_util.tree_flatten_with_path(params.representation)[0]
+        if "LayerNorm" in jax.tree_util.keystr(path)
+        and "scale" in jax.tree_util.keystr(path)
+    ]
+    repr_layernorm_gain = (
+        jnp.mean(jax.lax.stop_gradient(jnp.concatenate(layernorm_scales)))
+        if layernorm_scales
+        else jnp.array(jnp.nan)
+    )
+    # ### END COLLAPSE DIAGNOSTIC (logged below as training/repr_*) ############
+
     # scan loss over K unroll steps of dynamics model
     # ######################################################################
     # ### BOTTOM-UP STEP 2b: MuZero gradient scaling (Config.dynamics_gradient_scale)
@@ -2095,11 +2133,24 @@ def compute_muzero_loss(
     # dynamics_loss = jnp.mean(mse_value_loss(model_reward, data.reward))
 
     # l2 penalty
-    l2_penalty = (
-        l2_coef
-        * 0.5
-        * sum(jnp.sum(jnp.square(w)) for w in jax.tree_util.tree_leaves(params))
-    )
+    # ######################################################################
+    # ### L2 FIX (Config.l2_exclude_bias_and_norm): penalise only weight matrices
+    # ### (flax "kernel" params), not biases and LayerNorm scale/bias (standard
+    # ### AdamW practice). L2 on the LayerNorm gain pulls it towards 0, which makes
+    # ### the LayerNorm output (and thus the embedding) input-independent ->
+    # ### representation collapse when the task signal is weak (capacity run).
+    # ### Old: sum over all leaves of params.
+    # ######################################################################
+    if Config.l2_exclude_bias_and_norm:
+        l2_leaves = [
+            w
+            for path, w in jax.tree_util.tree_flatten_with_path(params)[0]
+            if "'kernel'" in jax.tree_util.keystr(path)
+        ]
+    else:
+        l2_leaves = jax.tree_util.tree_leaves(params)
+    l2_penalty = l2_coef * 0.5 * sum(jnp.sum(jnp.square(w)) for w in l2_leaves)
+    # ### END L2 FIX ###########################################################
 
     # Entropy
     # entropy = jnp.mean(parametric_action_distribution.entropy(policy_logits, rng))
@@ -2215,6 +2266,10 @@ def compute_muzero_loss(
         "l2_penalty": l2_penalty,
         **unroll_diagnostics,  # ### BOTTOM-UP STEP 2c
         "consistency_loss_k1plus": consistency_loss_k1plus,  # ### BOTTOM-UP STEP 3b
+        # ### COLLAPSE DIAGNOSTIC
+        "repr_pairwise_cosine": repr_pairwise_cosine,
+        "repr_feature_std": repr_feature_std,
+        "repr_layernorm_gain": repr_layernorm_gain,
         # 'entropy': entropy,
         # 'approx_kl': jax.lax.stop_gradient(approx_kl),
     }
