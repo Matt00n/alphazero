@@ -21,6 +21,20 @@ This is a reimplementation of the infamous [AlphaZero](https://arxiv.org/abs/171
 * Support for continuous action spaces
 
 
+## What it took, start to finish
 
+**Bugs fixed:**
+1. **Value targets** were bootstrapped from the current network at loss time. They now use stored GAE over the MCTS search values.
+2. **Prioritised replay read and wrote the wrong columns** of `MuZeroTransition`: goal transitions were never sampled, and `terminal_mask` was overwritten.
+3. **Truncation was treated as termination,** both in value targets and in the model's absorbing states.
+4. **Smaller fixes:** the n-step padding, the categorical decoding, PER importance weights, and the learning-rate schedule counting updates rather than environment steps.
 
-
+**Changes that made the difference:**
+- **Scalar value head** instead of 601 atoms.
+- **MuZero's gradient scaling and per-step loss weights.**
+- **Consistency loss 2.0** (from EfficientZero, not original MuZero).
+- **50 simulations.**
+- **Buffer 32768.**
+- **Gradient clip at 50, and no L2 on biases or LayerNorm.**
+- **Learning-rate decay over the last 20%.**
+- **Evaluation by visit count.**

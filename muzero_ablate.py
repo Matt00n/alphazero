@@ -83,13 +83,13 @@ class Config:
     action_repeat = 1
     eval_env = True
     num_resets_per_eval = 0
-    eval_every = 10
+    eval_every = 20
     deterministic_eval = True
     num_eval_envs = 64
     episode_length = 500
 
     # MCTS
-    num_simulations = 30
+    num_simulations = 50
     max_num_considered_actions = 16
     l2_coef = 1e-4  # 1e-4
     # ### L2 FIX (search "L2 FIX"): True -> L2 only on weight matrices (kernels),
@@ -146,7 +146,7 @@ class Config:
     # Weight of -cos(predicted embedding, stop_grad(representation(real obs)))
     # for unroll steps k >= 1 in the total loss (EfficientZero uses 2.0, there
     # with an extra projection/prediction head). 0.0 = off (previous behaviour).
-    consistency_loss_coef: float = 0.0
+    consistency_loss_coef: float = 2.0
 
     # ### DUAL EVAL (search "DUAL EVAL") ###
     # True: additionally evaluate with the most visited root action and no root
@@ -158,7 +158,7 @@ class Config:
     # the true-environment search from the same states; logs diag/* (agreement,
     # regret, root Q errors, goal detection, value drift k=1..8). Eval only.
     # Roughly doubles eval time.
-    planning_diagnostics: bool = True
+    planning_diagnostics: bool = False
 
     # reanalyze
     reanalyze: bool = False
@@ -167,13 +167,22 @@ class Config:
     min_replay_size: int = 8192
     max_replay_size: Optional[int] = 32768  # 8192 # 16384
     replay_buffer_batch_size: int = 128  # 256
-    per_alpha: float = 1.0  # 0.0
+    per_alpha: float = 0.6  # 0.0
     per_importance_sampling: bool = True
     per_importance_sampling_beta: float = 0.4  # 1.0
     # ### PER FIX: priority = (|value target - value| + per_epsilon) ** per_alpha
     # ### (was 1e-10 hard-coded; EfficientZero uses 1e-6). IS weights are now
     # ### normalised within the sampled batch and scale the WHOLE loss.
     per_epsilon: float = 1e-6
+    # ### REWARD-AWARE PER (search "REWARD-AWARE PER") ###
+    # priority = (|value error| + per_reward_priority_weight * |reward error| + eps)^alpha
+    # (reward error = one-step reward prediction error of the model; 0.0 -> value only)
+    per_reward_priority_weight: float = 1.0
+    # anneal the IS exponent beta from per_beta_start to per_beta_end over training
+    # (EfficientZero: alpha 0.6, beta 0.4 -> 1). Overrides per_importance_sampling_beta.
+    per_beta_anneal: bool = True
+    per_beta_start: float = 0.4
+    per_beta_end: float = 1.0
 
     # algorithm hyperparameters
     total_timesteps = int(1e6)
@@ -185,18 +194,23 @@ class Config:
     # ### training). False: previous behaviour (transition_steps = total_timesteps,
     # ### i.e. only ~7% decay over a run).
     anneal_lr_over_updates: bool = False
+    # ### LATE LR DECAY (search "LATE LR DECAY"): True -> constant lr for the first
+    # ### lr_decay_start_frac of the actual optimizer updates, then linear decay to
+    # ### 1% by the end of training. Overrides anneal_lr / anneal_lr_over_updates.
+    late_lr_decay: bool = True
+    lr_decay_start_frac: float = 0.8
     num_minibatches = 128  # 64
     update_epochs = (
         1  # NOTE: no reason to increase this, just increase sample size instead
     )
-    max_grad_norm = 0.5
+    max_grad_norm = 50
 
     # policy params
-    embedding_size: int = 128  # 64
+    embedding_size: int = 64  # 64
     policy_hidden_layer_sizes: Sequence[int] = (32,) * 4  # (32,) * 2  # (32,) * 4
     value_hidden_layer_sizes: Sequence[int] = (256,) * 5  # (256,) * 3  # (256,) * 5
     representation_hidden_layer_sizes: Sequence[int] = (
-        256,
+        64,
     ) * 2  # (64,) * 2 # (32,) * 2
     reward_hidden_layer_sizes: Sequence[int] = (64,) * 2  # (64,) * 2
     nstate_hidden_layer_sizes: Sequence[int] = (64,) * 2  # (64,) * 2
@@ -1477,6 +1491,27 @@ def split_termination_truncation(
     return termination, truncation
 
 
+# ##########################################################################
+# ### REWARD-AWARE PER: one-step reward prediction error of the learned model
+# ### for stored transitions, |r_hat(repr(o_t), a_t) - r_t| (the quantity the
+# ### reward loss trains at k=0). Used in the replay priorities so that rare goal
+# ### transitions (reward 0 vs. -1 everywhere else) are sampled more often.
+# ##########################################################################
+def reward_prediction_error(
+    representation_fn: Callable,
+    dynamics_fn: Callable,
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,
+    rewards: jnp.ndarray,
+) -> jnp.ndarray:
+    batch_shape = rewards.shape
+    obs = jnp.reshape(observations, (-1,) + observations.shape[len(batch_shape) :])
+    reward_pred, _ = dynamics_fn(
+        representation_fn(obs), jnp.reshape(actions, (-1,)).astype(jnp.int32)
+    )
+    return jnp.reshape(jnp.abs(reward_pred - jnp.reshape(rewards, (-1,))), batch_shape)
+
+
 def collect_targets(
     targets: Tuple[
         jnp.ndarray,
@@ -2405,7 +2440,8 @@ def main(_):
             bootstrap_value=jnp.zeros(Config.num_atoms),
             bootstrap_discount=0.0,
             extras={
-                "state_extras": {"truncation": 0.0},
+                # ### GOAL DIAGNOSTIC: + episode step counter (for episode lengths)
+                "state_extras": {"truncation": 0.0, "steps": 0.0},
                 "policy_extras": {
                     "prior_log_prob": 0.0,
                     "raw_action": 0.0,
@@ -2444,7 +2480,11 @@ def main(_):
             sample_batch_size=Config.replay_buffer_batch_size
             * Config.num_minibatches
             // device_count,
-            per_importance_sampling_beta=Config.per_importance_sampling_beta,
+            # ### REWARD-AWARE PER: beta = 1 in the buffer when annealing (the
+            # ### annealed beta is applied to the sampled weights in training_step)
+            per_importance_sampling_beta=(
+                1.0 if Config.per_beta_anneal else Config.per_importance_sampling_beta
+            ),
         )
     else:
         replay_buffer = replay_buffers.UniformSamplingQueue(  # UniformSamplingQueue Queue PrioritizedSamplingQueue
@@ -2508,7 +2548,30 @@ def main(_):
     # ### END LR SCHEDULE FIX ##################################################
 
     # create optimizer
-    if Config.anneal_lr:
+    # ######################################################################
+    # ### LATE LR DECAY (Config.late_lr_decay): constant lr for the first
+    # ### lr_decay_start_frac of the optimizer updates, then linear decay to 1%
+    # ### over the rest. Takes precedence over the anneal_lr variants below.
+    # ######################################################################
+    if Config.late_lr_decay:
+        decay_start = int(Config.lr_decay_start_frac * total_optimizer_updates)
+        learning_rate = optax.join_schedules(
+            [
+                optax.constant_schedule(Config.learning_rate),
+                optax.linear_schedule(
+                    Config.learning_rate,
+                    Config.learning_rate * 0.01,
+                    transition_steps=max(total_optimizer_updates - decay_start, 1),
+                ),
+            ],
+            boundaries=[decay_start],
+        )
+        logging.info(
+            f"late lr decay: constant until update {decay_start}, then linear to "
+            f"{Config.learning_rate * 0.01} at update {total_optimizer_updates}"
+        )
+    # ### END LATE LR DECAY ####################################################
+    elif Config.anneal_lr:
         learning_rate = optax.linear_schedule(
             Config.learning_rate,
             Config.learning_rate * 0.01,  # 0
@@ -2600,6 +2663,28 @@ def main(_):
 
         def f(*args, optimizer_state):
             value, grads = loss_and_pgrad_fn(*args)
+            # ##################################################################
+            # ### GRAD NORM DIAGNOSTIC: gradient norms BEFORE clipping (metrics
+            # ### only). grad_clip_frac = fraction of updates where the global
+            # ### norm exceeds max_grad_norm, i.e. clip_by_global_norm rescales
+            # ### the gradients of ALL networks by max_grad_norm / grad_norm.
+            # ##################################################################
+            if has_aux:
+                loss, metrics = value
+                grad_norm = optax.global_norm(grads)
+                metrics = {
+                    **metrics,
+                    "grad_norm": grad_norm,
+                    "grad_clip_frac": (grad_norm > Config.max_grad_norm).astype(
+                        jnp.float32
+                    ),
+                    "grad_norm_policy": optax.global_norm(grads.policy),
+                    "grad_norm_value": optax.global_norm(grads.value),
+                    "grad_norm_representation": optax.global_norm(grads.representation),
+                    "grad_norm_dynamics": optax.global_norm(grads.dynamics),
+                }
+                value = (loss, metrics)
+            # ### END GRAD NORM DIAGNOSTIC #####################################
             params_update, optimizer_state = optimizer.update(grads, optimizer_state)
             params = optax.apply_updates(args[0], params_update)
             return value, params, optimizer_state
@@ -2682,7 +2767,7 @@ def main(_):
             key_generate_unroll,
             Config.unroll_length,
             deterministic_actions=False,
-            extra_fields=("truncation",),
+            extra_fields=("truncation", "steps"),  # ### GOAL DIAGNOSTIC: + steps
         )
 
         # additional search at final step for bootstrap values
@@ -2695,7 +2780,7 @@ def main(_):
             dynamics_fn,
             key_bootstrap,
             deterministic_actions=False,
-            extra_fields=("truncation",),
+            extra_fields=("truncation", "steps"),  # ### GOAL DIAGNOSTIC: + steps
         )
 
         assert data.discount.shape[0] == Config.unroll_length
@@ -2713,6 +2798,16 @@ def main(_):
             ),
             "search_root_q_spread": jnp.mean(
                 data.extras["policy_extras"]["root_q_spread"]
+            ),
+            # ### GOAL DIAGNOSTIC: goal terminations / time limits in the freshly
+            # ### collected training unroll (ratios derived per epoch, see
+            # ### training_epoch_with_timing)
+            "train_goals": jnp.sum(termination),
+            "train_timeouts": jnp.sum(truncation),
+            # sum of lengths of the episodes that ended in this unroll (the
+            # wrapper's step counter at the done step is the episode length)
+            "train_episode_length_sum": jnp.sum(
+                (termination + truncation) * data.extras["state_extras"]["steps"]
             ),
         }
 
@@ -2744,6 +2839,15 @@ def main(_):
         )
         priorities = (
             jnp.mean(jnp.abs(targets - data.bootstrap_value), axis=-1)
+            # ### REWARD-AWARE PER: + weighted one-step reward prediction error
+            + Config.per_reward_priority_weight
+            * reward_prediction_error(
+                representation_fn,
+                dynamics_fn,
+                data.observation,
+                data.action,
+                data.reward,
+            )
             + Config.per_epsilon  # ### PER FIX, was: + 1e-10
         ) ** Config.per_alpha
 
@@ -2825,6 +2929,30 @@ def main(_):
         # sampling from replay buffer
         buffer_state, data = replay_buffer.sample(buffer_state)
 
+        # ### GOAL DIAGNOSTIC: fraction of goal transitions (real termination at
+        # ### k=0) in the sampled training batch = the goal signal the nets see
+        sampled_termination, _ = split_termination_truncation(
+            data.discount, data.extras["state_extras"]["truncation"]
+        )
+        search_diagnostics["train_batch_goal_frac"] = jnp.mean(sampled_termination)
+
+        # ### REWARD-AWARE PER: anneal the importance-sampling exponent beta from
+        # ### per_beta_start to per_beta_end over training. The buffer returns
+        # ### weights for beta = 1 normalised by the batch max; raising them to the
+        # ### power beta gives exactly the batch-max-normalised weights for beta.
+        if Config.per_beta_anneal:
+            beta_progress = jnp.clip(
+                (training_state.env_steps - num_prefill_env_steps)
+                / (Config.total_timesteps - num_prefill_env_steps),
+                0.0,
+                1.0,
+            )
+            per_beta = Config.per_beta_start + beta_progress * (
+                Config.per_beta_end - Config.per_beta_start
+            )
+            data = data._replace(weight=data.weight**per_beta)
+            search_diagnostics["per_beta"] = per_beta
+
         # reanalyze
         # data = reanalyze_fn(data, forward_fn, env, reanalyze_key)
 
@@ -2851,6 +2979,15 @@ def main(_):
         values = forward_fn(hidden)[1]
         priorities = (
             jnp.mean(jnp.abs(targets - values), axis=-1)
+            # ### REWARD-AWARE PER: + weighted one-step reward prediction error
+            + Config.per_reward_priority_weight
+            * reward_prediction_error(
+                representation_fn,
+                dynamics_fn,
+                data.observation,
+                data.action,
+                data.reward,
+            )
             + Config.per_epsilon  # ### PER FIX, was: + 1e-10
         ) ** Config.per_alpha
         buffer_state = replay_buffer.set_priorities(
@@ -2860,7 +2997,7 @@ def main(_):
         metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
         # ### LR SCHEDULE FIX: log the lr used in this training step (the
         # ### optimizer count = number of updates done so far)
-        if Config.anneal_lr:
+        if callable(learning_rate):  # ### LATE LR DECAY, was: if Config.anneal_lr
             updates_done = (
                 (training_state.env_steps - num_prefill_env_steps)
                 / env_step_per_training_step
@@ -2925,6 +3062,21 @@ def main(_):
             "training/epoch_training_time": np.round(epoch_training_time),
             **{f"training/{name}": float(value) for name, value in metrics.items()},
         }
+        # ### GOAL DIAGNOSTIC: ratios of epoch sums (means of per-step counts), so
+        # ### training steps without any finished episode do not bias them
+        if "training/train_goals" in metrics:
+            episode_ends = (
+                metrics["training/train_goals"] + metrics["training/train_timeouts"]
+            )
+            episode_length_sum = metrics.pop("training/train_episode_length_sum")
+            metrics["training/train_goal_frac"] = (
+                metrics["training/train_goals"] / episode_ends
+                if episode_ends > 0
+                else 0.0
+            )
+            metrics["training/train_episode_length"] = (
+                episode_length_sum / episode_ends if episode_ends > 0 else float("nan")
+            )
         return (
             training_state,
             env_state,
@@ -2966,7 +3118,7 @@ def main(_):
             key_generate_unroll,
             num_prefill_actor_steps,
             deterministic_actions=False,
-            extra_fields=("truncation",),
+            extra_fields=("truncation", "steps"),  # ### GOAL DIAGNOSTIC: + steps
         )
 
         # additional search at final step for bootstrap values
@@ -2979,7 +3131,7 @@ def main(_):
             dynamics_fn,
             key_bootstrap,
             deterministic_actions=False,
-            extra_fields=("truncation",),
+            extra_fields=("truncation", "steps"),  # ### GOAL DIAGNOSTIC: + steps
         )
 
         assert data.discount.shape[0] == num_prefill_actor_steps
@@ -3017,6 +3169,15 @@ def main(_):
         )
         priorities = (
             jnp.mean(jnp.abs(targets - data.bootstrap_value), axis=-1)
+            # ### REWARD-AWARE PER: + weighted one-step reward prediction error
+            + Config.per_reward_priority_weight
+            * reward_prediction_error(
+                representation_fn,
+                dynamics_fn,
+                data.observation,
+                data.action,
+                data.reward,
+            )
             + Config.per_epsilon  # ### PER FIX, was: + 1e-10
         ) ** Config.per_alpha
 
