@@ -106,13 +106,28 @@ class Config:
     num_atoms: int = (
         1  # 8 # NOTE: num_atoms = 1 yields non-distributional RL with MSE loss
     )
+    # ### QR VALUE HEAD (search "QR VALUE HEAD"): num_atoms > 1 with
+    # ### categorical_value = False -> quantile-regression value head with
+    # ### num_atoms quantiles (quantile Huber loss, kappa = qr_kappa).
     qr_kappa: float = 1.0
 
     # ### ABLATION STEP: scalar value head (search "ABLATION STEP: scalar value") ###
     # False: scalar value head trained with MSE (as in alphazero.py).
     # True:  601-atom categorical value head with h-transform + cross-entropy
     #        (MuZero Appendix F), i.e. the previous behaviour.
-    categorical_value: bool = False
+    categorical_value: bool = True
+    # ### CATEGORICAL SUPPORT (search "CATEGORICAL SUPPORT"): range (+-max in
+    # ### h-space) and atom spacing of the categorical value / reward supports.
+    # ### None -> MuZero's Atari support: 601 integer atoms (+-300, step 1).
+    # ### Acrobot: |V| <= ~120 -> h in [-10, 10]; rewards {-1, 0} -> h in [-0.42, 0].
+    value_support_max: Optional[float] = 10.0  # only used if categorical_value
+    value_support_step: float = 0.25  # -> 81 atoms
+    reward_support_max: Optional[float] = None  # None = 601 atoms (as in run A)
+    reward_support_step: float = 0.25  # e.g. reward_support_max=2.0 -> 17 atoms
+    # ### RAW-SPACE TWO-HOT (search "RAW-SPACE TWO-HOT"): False -> MuZero h-space
+    # ### two-hot + h^-1(E[i]) decoding (default). True -> DreamerV3-style: same
+    # ### atoms, two-hot and decoding in raw value space (unbiased mean).
+    value_raw_space_twohot: bool = False
 
     # ### BOTTOM-UP STEP 1: learned representation (search "BOTTOM-UP STEP 1") ###
     # True:  real representation MLP -> embedding_size, search still on true env.
@@ -146,7 +161,7 @@ class Config:
     # Weight of -cos(predicted embedding, stop_grad(representation(real obs)))
     # for unroll steps k >= 1 in the total loss (EfficientZero uses 2.0, there
     # with an extra projection/prediction head). 0.0 = off (previous behaviour).
-    consistency_loss_coef: float = 2.0
+    consistency_loss_coef: float = 0.0
 
     # ### DUAL EVAL (search "DUAL EVAL") ###
     # True: additionally evaluate with the most visited root action and no root
@@ -364,9 +379,9 @@ def make_forward_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
             # ### scalar head outputs the value directly -> no decoding needed
             if Config.categorical_value:
                 # value = inverse_scalar_transform(value) # VALUE TEST logits_to_scalar_expectation
-                value = logits_to_scalar_expectation(
-                    value
-                )  # VALUE TEST logits_to_scalar_expectation
+                # ### RAW-SPACE TWO-HOT: decode_value_logits dispatches between
+                # ### h-space (MuZero, default) and raw-space (DreamerV3) decoding
+                value = decode_value_logits(value)
             # ### END ABLATION STEP
 
             return logits, value
@@ -413,7 +428,8 @@ def make_dynamics_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
             )
             # reward = inverse_scalar_transform(reward) # get expected value of distributional reward estimate logits_to_scalar_expectation
             reward = logits_to_scalar_expectation(
-                reward
+                reward,
+                support_max=reward_support()[1],  # ### CATEGORICAL SUPPORT
             )  # get expected value of distributional reward estimate logits_to_scalar_expectation
             return jnp.mean(reward, axis=-1), hidden_state
 
@@ -440,6 +456,10 @@ def make_az_networks(
     feature_extractor_dense_hidden_layer_sizes: Optional[Sequence[int]] = (512,),
 ) -> Union[AZNetworks, AtariAZNetworkParams]:
     """Make networks with preprocessor."""
+    # ### QR VALUE HEAD: categorical and quantile heads are mutually exclusive
+    assert not (Config.categorical_value and Config.num_atoms > 1), (
+        "categorical_value requires num_atoms == 1 (num_atoms > 1 = QR head)"
+    )
     if discrete_policy:
         parametric_action_distribution = DiscreteDistribution(param_size=action_size)
     elif sqash_distribution:
@@ -478,7 +498,7 @@ def make_az_networks(
     dynamics_network = make_dynamics_network(
         embedding_size=hidden_size[0],  # ### BOTTOM-UP STEP 1, was: observation_size[0]
         num_actions=action_size,
-        num_reward_atoms=601,  # TODO get as input
+        num_reward_atoms=reward_support()[0],  # ### CATEGORICAL SUPPORT, was: 601
         preprocess_observation_fn=lambda x, y: x,
         hidden_layer_sizes_reward=reward_hidden_layer_sizes,
         hidden_layer_sizes_next_state=nstate_hidden_layer_sizes,
@@ -494,7 +514,9 @@ def make_az_networks(
     value_network = make_value_network(
         hidden_size,  # ### BOTTOM-UP STEP 1, was: observation_size
         # ### ABLATION STEP: scalar value head (see Config.categorical_value)
-        num_atoms=601 if Config.categorical_value else 1,  # was: 601  # value test
+        # ### CATEGORICAL SUPPORT: was 601 if Config.categorical_value else 1
+        # ### QR VALUE HEAD: Config.num_atoms quantiles (1 = scalar MSE head)
+        num_atoms=value_support()[0] if Config.categorical_value else Config.num_atoms,
         preprocess_observation_fn=lambda x, y: x,
         hidden_layer_sizes=value_hidden_layer_sizes,
         activation=activation,
@@ -1134,7 +1156,8 @@ class PlanningDiagnostics:
             T = traj["obs"].shape[0]
             obs_flat = jnp.reshape(traj["obs"], (T * num_envs,) + traj["obs"].shape[2:])
             h_real = representation_fn(obs_flat)  # [T*B, E]
-            v_real = jnp.reshape(forward(h_real)[1][..., 0], (T, num_envs))
+            # ### QR VALUE HEAD: quantile mean (identical to [..., 0] for 1 atom)
+            v_real = jnp.reshape(jnp.mean(forward(h_real)[1], axis=-1), (T, num_envs))
             h = h_real
             not_done_so_far = act  # valid start: active, no episode end in between
             for k in range(1, max_drift_steps + 1):
@@ -1146,7 +1169,7 @@ class PlanningDiagnostics:
                 )
                 _, h = dynamics_fn(h, jnp.reshape(a_prev, (T * num_envs,)))
                 not_done_so_far = not_done_so_far * (1.0 - done_prev)
-                v_pred = jnp.reshape(forward(h)[1][..., 0], (T, num_envs))
+                v_pred = jnp.reshape(jnp.mean(forward(h)[1], axis=-1), (T, num_envs))
                 v_target = jnp.concatenate([v_real[k:], jnp.zeros((k, num_envs))])
                 valid = not_done_so_far * jnp.concatenate(
                     [jnp.ones((T - k, num_envs)), jnp.zeros((k, num_envs))]
@@ -1208,9 +1231,39 @@ def reanalyze(
     return data
 
 
+# ##########################################################################
+# ### CATEGORICAL SUPPORT: configurable range and resolution of the categorical
+# ### value / reward support in h-space (MuZero: 601 integer atoms, i.e. range
+# ### +-300 with step 1, sized for Atari). num_atoms = 2 * round(max / step) + 1,
+# ### atoms at i * step for i = -M..M. support_max=None -> old integer support
+# ### (step 1), bit-identical to the previous implementation.
+# ##########################################################################
+def num_support_atoms(support_max: Optional[float], support_step: float) -> int:
+    if support_max is None:  # old MuZero / Atari support: 601 integer atoms
+        return 601
+    return 2 * int(round(support_max / support_step)) + 1
+
+
+def value_support() -> Tuple[int, Optional[float]]:
+    """(num_atoms, support_max) of the categorical value head."""
+    return (
+        num_support_atoms(Config.value_support_max, Config.value_support_step),
+        Config.value_support_max,
+    )
+
+
+def reward_support() -> Tuple[int, Optional[float]]:
+    """(num_atoms, support_max) of the categorical reward head."""
+    return (
+        num_support_atoms(Config.reward_support_max, Config.reward_support_step),
+        Config.reward_support_max,
+    )
+
+
 def invertible_scalar_transformation(
     x: jnp.ndarray,
     num_atoms: int,
+    support_max: Optional[float] = None,  # ### CATEGORICAL SUPPORT
 ) -> jnp.ndarray:
     epsilon = 0.001
     sign = jnp.sign(x)
@@ -1219,11 +1272,14 @@ def invertible_scalar_transformation(
     # remove the trailing singleton if present
     x = jnp.squeeze(x)  # now shape [...]
     M = num_atoms // 2
-    centers = jnp.arange(-M, M + 1, dtype=x.dtype)  # shape (S,)
+    # ### CATEGORICAL SUPPORT: atom spacing (1.0 for the old integer support)
+    step = 1.0 if support_max is None else support_max / M
+    centers = jnp.arange(-M, M + 1, dtype=x.dtype) * step  # shape (S,)
     # clip outliers in original array
-    x = jnp.clip(x, -M, M)
-    # compute 1 - |x - i|; this is positive only for |x - i| < 1, i.e. only at floor(x) and ceil(x)
-    w = 1.0 - jnp.abs(x[..., None] - centers)  # shape [..., S]
+    x = jnp.clip(x, -M * step, M * step)
+    # compute 1 - |x - c| / step; this is positive only for the two neighbouring
+    # atoms of x (two-hot encoding in h-space)
+    w = 1.0 - jnp.abs(x[..., None] - centers) / step  # shape [..., S]
     # clip negatives to zero
     return jnp.clip(w, 0.0)
 
@@ -1275,7 +1331,11 @@ def scalar_untransform(y: jnp.ndarray, eps: float = 1e-3) -> jnp.ndarray:
     )
 
 
-def logits_to_scalar_expectation(logits: jnp.ndarray, eps: float = 1e-3) -> jnp.ndarray:
+def logits_to_scalar_expectation(
+    logits: jnp.ndarray,
+    eps: float = 1e-3,
+    support_max: Optional[float] = None,  # ### CATEGORICAL SUPPORT
+) -> jnp.ndarray:
     # ######################################################################
     # ### FIX: decoding now matches the encoding (MuZero paper, Appendix F):
     # ### "the actual value and rewards are obtained by first computing their
@@ -1301,11 +1361,67 @@ def logits_to_scalar_expectation(logits: jnp.ndarray, eps: float = 1e-3) -> jnp.
     probs = jax.nn.softmax(logits, axis=-1)
     n = logits.shape[-1]
     k = (n - 1) // 2
-    support = jnp.arange(-k, k + 1, dtype=logits.dtype)  # in φ-space
+    # ### CATEGORICAL SUPPORT: atom spacing (1.0 for the old integer support)
+    step = 1.0 if support_max is None else support_max / k
+    support = jnp.arange(-k, k + 1, dtype=logits.dtype) * step  # in φ-space
     transformed_value = jnp.sum(probs * support, axis=-1, keepdims=True)  # E_p[i]
     value = scalar_untransform(transformed_value, eps=eps)  # φ^{-1}(E_p[i])
     # ### END FIX ############################################################
     return value
+
+
+# ##########################################################################
+# ### RAW-SPACE TWO-HOT (Config.value_raw_space_twohot, DreamerV3-style): atoms
+# ### are spaced evenly in h-space (same support as above) but the two-hot
+# ### interpolation and the decoding happen in RAW space:
+# ###   atoms a_i = h^-1(i * step),  target -> two-hot between neighbouring a_i
+# ###   linear in raw value,  decoded value = sum_i p_i a_i.
+# ### The mean of a mixture of two-hots is then the mean of the targets
+# ### (unbiased under noisy targets), whereas MuZero's h-space version estimates
+# ### h^-1(E[h(G)]) (Jensen bias towards smaller |V| for noisy targets).
+# ##########################################################################
+def raw_space_atoms(num_atoms: int, support_max: Optional[float]) -> jnp.ndarray:
+    M = num_atoms // 2
+    step = 1.0 if support_max is None else support_max / M
+    return scalar_untransform(jnp.arange(-M, M + 1, dtype=jnp.float32) * step)
+
+
+def raw_space_twohot(
+    x: jnp.ndarray, num_atoms: int, support_max: Optional[float]
+) -> jnp.ndarray:
+    atoms = raw_space_atoms(num_atoms, support_max)  # increasing, [S]
+    x = jnp.clip(jnp.squeeze(x), atoms[0], atoms[-1])
+    right_gap = jnp.concatenate([atoms[1:] - atoms[:-1], jnp.array([jnp.inf])])
+    left_gap = jnp.concatenate([jnp.array([jnp.inf]), atoms[1:] - atoms[:-1]])
+    d = x[..., None] - atoms  # [..., S]
+    w = jnp.where(d >= 0, 1.0 - d / right_gap, 1.0 + d / left_gap)
+    return jnp.clip(w, 0.0, 1.0)
+
+
+def raw_space_expectation(
+    logits: jnp.ndarray, support_max: Optional[float]
+) -> jnp.ndarray:
+    atoms = raw_space_atoms(logits.shape[-1], support_max)
+    probs = jax.nn.softmax(logits, axis=-1)
+    return jnp.sum(probs * atoms, axis=-1, keepdims=True)
+
+
+def decode_value_logits(logits: jnp.ndarray) -> jnp.ndarray:
+    """Decoded scalar value of the categorical value head (per Config)."""
+    if Config.value_raw_space_twohot:
+        return raw_space_expectation(logits, value_support()[1])
+    return logits_to_scalar_expectation(logits, support_max=value_support()[1])
+
+
+def encode_value_targets(x: jnp.ndarray) -> jnp.ndarray:
+    """Two-hot targets of the categorical value head (per Config)."""
+    n_atoms, support_max = value_support()
+    if Config.value_raw_space_twohot:
+        return raw_space_twohot(x, n_atoms, support_max)
+    return invertible_scalar_transformation(x, n_atoms, support_max=support_max)
+
+
+# ### END RAW-SPACE TWO-HOT ##################################################
 
 
 def n_step_bootstrapped_targets(
@@ -2042,6 +2158,18 @@ def compute_muzero_loss(
         chex.assert_shape(vs, (Config.replay_buffer_batch_size, Config.num_atoms))
         # v_losses = value_loss_fn(baseline, jax.lax.stop_gradient(vs))
 
+        # ### VALUE BIAS DIAGNOSTIC (metrics only): decoded value prediction minus
+        # ### its (scalar) value target, per sample. Scalar MSE head -> ~0 on
+        # ### average; MuZero's h-space categorical head is expected to be biased
+        # ### towards smaller |V| for noisy targets (Jensen).
+        value_pred_scalar = (
+            decode_value_logits(baseline) if Config.categorical_value else baseline
+        )
+        # ### QR VALUE HEAD: compare quantile means (identical for 1 atom)
+        value_error = jax.lax.stop_gradient(
+            jnp.mean(value_pred_scalar, axis=-1) - jnp.mean(vs, axis=-1)
+        )
+
         # ##################################################################
         # ### ABLATION STEP: scalar value head (see Config.categorical_value)
         # ### False -> MSE on the scalar value output, exactly as alphazero.py
@@ -2049,12 +2177,37 @@ def compute_muzero_loss(
         # ##################################################################
         if Config.categorical_value:
             # VALUE TEST
-            vs = invertible_scalar_transformation(vs, 601)
-            chex.assert_shape(vs, (Config.replay_buffer_batch_size, 601))
-            chex.assert_shape(baseline, (Config.replay_buffer_batch_size, 601))
+            # ### CATEGORICAL SUPPORT, was: invertible_scalar_transformation(vs, 601)
+            n_value_atoms, value_support_max = value_support()
+            # ### RAW-SPACE TWO-HOT: encode_value_targets dispatches between
+            # ### h-space (MuZero, default) and raw-space (DreamerV3) two-hot
+            vs = encode_value_targets(vs)
+            chex.assert_shape(vs, (Config.replay_buffer_batch_size, n_value_atoms))
+            chex.assert_shape(
+                baseline, (Config.replay_buffer_batch_size, n_value_atoms)
+            )
             v_losses = -jnp.sum(
                 jax.lax.stop_gradient(vs) * (jax.nn.log_softmax(baseline)), axis=-1
             )
+        elif Config.num_atoms > 1:
+            # ##############################################################
+            # ### QR VALUE HEAD (Config.num_atoms > 1, categorical_value False):
+            # ### value head outputs num_atoms quantiles of the return; targets
+            # ### are the per-quantile GAE returns over the stored (quantile)
+            # ### search values; quantile Huber loss (Dabney et al. 2017, as in
+            # ### alphazero.py / AlphaTensor). The search uses the quantile mean
+            # ### (mctx_dist qtransforms average over the atom axis).
+            # ##############################################################
+            chex.assert_shape(
+                baseline, (Config.replay_buffer_batch_size, Config.num_atoms)
+            )
+            v_losses = quantile_regression_loss(
+                baseline,
+                jax.lax.stop_gradient(vs),
+                kappa=Config.qr_kappa,
+                num_atoms=Config.num_atoms,
+            )
+            # ### END QR VALUE HEAD ##########################################
         else:
             chex.assert_shape(baseline, (Config.replay_buffer_batch_size, 1))
             v_losses = mse_value_loss(baseline, jax.lax.stop_gradient(vs))
@@ -2070,8 +2223,10 @@ def compute_muzero_loss(
 
         # dynamics (reward) function loss
         # TODO get reward atoms as input
+        # ### CATEGORICAL SUPPORT, was: invertible_scalar_transformation(reward_targets, 601)
+        n_reward_atoms, reward_support_max = reward_support()
         reward_targets = invertible_scalar_transformation(
-            reward_targets, 601
+            reward_targets, n_reward_atoms, support_max=reward_support_max
         )  # distributional value loss, see MuZero paper
         dynamics_loss = -jnp.sum(
             jax.lax.stop_gradient(reward_targets) * (jax.nn.log_softmax(model_reward)),
@@ -2099,6 +2254,7 @@ def compute_muzero_loss(
             v_loss,
             dynamics_loss,
             consistency_loss,
+            value_error,  # ### VALUE BIAS DIAGNOSTIC
         )
 
     chex.assert_shape(
@@ -2124,7 +2280,7 @@ def compute_muzero_loss(
 
     # jax.debug.print('targets: {x}', x=targets)
 
-    _, (policy_loss, v_loss, dynamics_loss, consistency_loss) = jax.lax.scan(
+    _, (policy_loss, v_loss, dynamics_loss, consistency_loss, value_error) = jax.lax.scan(
         unroll_loss,
         # ### BOTTOM-UP STEP 2b: first dynamics call (on representation output) unscaled
         (hidden, jnp.ones((), dtype=hidden.dtype)),
@@ -2253,6 +2409,11 @@ def compute_muzero_loss(
         "policy_loss_k1plus": masked_mean(policy_loss[1:], mask[1:]),
         "value_loss_k0": masked_mean(v_loss[:1], unroll_mask[:1]),
         "value_loss_k1plus": masked_mean(v_loss[1:], unroll_mask[1:]),
+        # ### VALUE BIAS DIAGNOSTIC: mean signed / absolute error of the decoded
+        # ### value vs its target (unweighted; batch is PER-sampled if alpha > 0)
+        "value_bias_k0": masked_mean(value_error[:1], unroll_mask[:1]),
+        "value_bias_k1plus": masked_mean(value_error[1:], unroll_mask[1:]),
+        "value_abs_err_k0": masked_mean(jnp.abs(value_error[:1]), unroll_mask[:1]),
     }
 
     # ######################################################################
