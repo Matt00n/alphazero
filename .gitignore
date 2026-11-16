@@ -7,7 +7,6 @@ plots/
 test_implementations/
 *.ipynb
 muzero_no_replay.py
-ppo_template.py
 plan.md
 secret_stuff.py
 super_secret_stuff.py
