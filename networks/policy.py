@@ -1,8 +1,7 @@
-from typing import Any, Mapping, Protocol, Tuple, TypeVar
+from collections.abc import Mapping
+from typing import Any, Protocol, TypeVar
 
 import jax.numpy as jnp
-
-
 
 NetworkType = TypeVar('NetworkType')
 
@@ -13,7 +12,7 @@ class Policy(Protocol):
       self,
       observation: jnp.ndarray,
       key: jnp.ndarray,
-  ) -> Tuple[jnp.ndarray, Mapping[str, Any]]:
+  ) -> tuple[jnp.ndarray, Mapping[str, Any]]:
     pass
 
 
@@ -22,7 +21,7 @@ class ForwardPass(Protocol):
   def __call__(
       self,
       observation: jnp.ndarray,
-  ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  ) -> tuple[jnp.ndarray, jnp.ndarray]:
     pass
 
 
@@ -41,7 +40,7 @@ class BaseDynamicsFn(Protocol):
       self,
       hidden_state: jnp.ndarray,
       action: jnp.ndarray,
-  ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  ) -> tuple[jnp.ndarray, jnp.ndarray]:
     pass
   
 

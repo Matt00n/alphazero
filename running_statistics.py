@@ -5,36 +5,36 @@ This file was taken from Brax and modified to simplify dependencies:
 https://github.com/google/brax/blob/main/brax/training/acme/running_statistics.py
 """
 
-from typing import Any, Optional, Tuple, Union
+from typing import Any
 
-from flax import struct
 import jax
 import jax.numpy as jnp
+from flax import struct
 
 
-def _zeros_like(nest: Union[jnp.ndarray, Any], dtype=None) -> Union[jnp.ndarray, Any]:
+def _zeros_like(nest: jnp.ndarray | Any, dtype=None) -> jnp.ndarray | Any:
     return jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype or x.dtype), nest)
 
 
-def _ones_like(nest: Union[jnp.ndarray, Any], dtype=None) -> Union[jnp.ndarray, Any]:
+def _ones_like(nest: jnp.ndarray | Any, dtype=None) -> jnp.ndarray | Any:
     return jax.tree_util.tree_map(lambda x: jnp.ones(x.shape, dtype or x.dtype), nest)
 
 
 @struct.dataclass
 class NestedMeanStd:
     """A container for running statistics (mean, std) of possibly nested data."""
-    mean: Union[jnp.ndarray, Any]
-    std: Union[jnp.ndarray, Any]
+    mean: jnp.ndarray | Any
+    std: jnp.ndarray | Any
 
 
 @struct.dataclass
 class RunningStatisticsState(NestedMeanStd):
     """Full state of running statistics computation."""
     count: jnp.ndarray
-    summed_variance: Union[jnp.ndarray, Any]
+    summed_variance: jnp.ndarray | Any
 
 
-def init_state(nest: Union[jnp.ndarray, Any]) -> RunningStatisticsState:
+def init_state(nest: jnp.ndarray | Any) -> RunningStatisticsState:
     """Initializes the running statistics for the given nested structure."""
     dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
 
@@ -49,7 +49,7 @@ def init_state(nest: Union[jnp.ndarray, Any]) -> RunningStatisticsState:
 
 def _validate_batch_shapes(batch: jnp.ndarray,
                            reference_sample: jnp.ndarray,
-                           batch_dims: Tuple[int, ...]) -> None:
+                           batch_dims: tuple[int, ...]) -> None:
     """Verifies shapes of the batch leaves against the reference sample.
 
     Checks that batch dimensions are the same in all leaves in the batch.
@@ -73,12 +73,12 @@ def _validate_batch_shapes(batch: jnp.ndarray,
 
 
 def update(state: RunningStatisticsState,
-           batch: Union[jnp.ndarray, Any],
+           batch: jnp.ndarray | Any,
            *,
-           weights: Optional[jnp.ndarray] = None,
+           weights: jnp.ndarray | None = None,
            std_min_value: float = 1e-6,
            std_max_value: float = 1e6,
-           pmap_axis_name: Optional[str] = None,
+           pmap_axis_name: str | None = None,
            validate_shapes: bool = True) -> RunningStatisticsState:
     """Updates the running statistics with the given batch of data.
 
@@ -126,14 +126,13 @@ def update(state: RunningStatisticsState,
     # compatible, arrays will be silently broadcasted resulting in incorrect
     # statistics.
     if validate_shapes:
-        if weights is not None:
-          if weights.shape != batch_dims:
-              raise ValueError(f'{weights.shape} != {batch_dims}')
+        if weights is not None and weights.shape != batch_dims:
+            raise ValueError(f'{weights.shape} != {batch_dims}')
         _validate_batch_shapes(batch, state.mean, batch_dims)
 
     def _compute_node_statistics(
         mean: jnp.ndarray, summed_variance: jnp.ndarray,
-        batch: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        batch: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         assert isinstance(mean, jnp.ndarray), type(mean)
         assert isinstance(summed_variance, jnp.ndarray), type(summed_variance)
         # The mean and the sum of past variances are updated with Welford's
@@ -182,7 +181,7 @@ def update(state: RunningStatisticsState,
 
 def normalize(batch: jnp.ndarray,
               mean_std: NestedMeanStd,
-              max_abs_value: Optional[float] = None) -> jnp.ndarray:
+              max_abs_value: float | None = None) -> jnp.ndarray:
     """Normalizes data using running statistics."""
 
     def normalize_leaf(data: jnp.ndarray, mean: jnp.ndarray,

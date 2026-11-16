@@ -3,8 +3,8 @@ import copy
 
 import jax
 
-from envs import jumpy as jp
 from envs import brax_env
+from envs import jumpy as jp
 
 
 def wrap_for_training(env: brax_env.Env,

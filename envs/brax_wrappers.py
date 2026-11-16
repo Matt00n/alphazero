@@ -15,10 +15,9 @@
 # pylint:disable=g-multiple-import, g-importing-member
 """Wrappers to support Brax training."""
 
-from typing import Dict, Optional
 
-from flax import struct
 import jax
+from flax import struct
 from jax import numpy as jp
 
 from envs.brax_env import Env, Wrapper
@@ -51,7 +50,7 @@ def wrap_for_training(
 class VmapWrapper(Wrapper):
     """Vectorizes Brax env."""
 
-    def __init__(self, env: Env, batch_size: Optional[int] = None):
+    def __init__(self, env: Env, batch_size: int | None = None):
         super().__init__(env)
         self.batch_size = batch_size
 
@@ -145,7 +144,7 @@ class EvalMetrics:
         episode_steps: Integer vector tracking the number of steps in the episode.
     """
 
-    episode_metrics: Dict[str, jax.Array]
+    episode_metrics: dict[str, jax.Array]
     active_episodes: jax.Array
     episode_steps: jax.Array
 
@@ -169,7 +168,7 @@ class EvalWrapper(Wrapper):
     def step(self, state: State, action: jax.Array) -> State:
         state_metrics = state.info['eval_metrics']
         if not isinstance(state_metrics, EvalMetrics):
-            raise ValueError(
+            raise TypeError(
                 f'Incorrect type for state_metrics: {type(state_metrics)}'
             )
         del state.info['eval_metrics']

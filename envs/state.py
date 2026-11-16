@@ -1,14 +1,14 @@
 
 import copy
 import functools
-from typing import Any, Dict, Optional, Sequence, Union
+from collections.abc import Sequence
+from typing import Any
 
-from flax import struct
 import jax
+from flax import struct
 from jax import numpy as jp
 from jax import vmap
 from jax.tree_util import tree_map
-
 
 
 @struct.dataclass
@@ -49,12 +49,12 @@ class Base:
         return tree_map(lambda *x: jp.concatenate(x, axis=axis), self, *others)
 
     def index_set(
-        self, idx: Union[jp.ndarray, Sequence[jp.ndarray]], o: Any
+        self, idx: jp.ndarray | Sequence[jp.ndarray], o: Any
     ) -> Any:
         return tree_map(lambda x, y: x.at[idx].set(y), self, o)
 
     def index_sum(
-        self, idx: Union[jp.ndarray, Sequence[jp.ndarray]], o: Any
+        self, idx: jp.ndarray | Sequence[jp.ndarray], o: Any
     ) -> Any:
         return tree_map(lambda x, y: x.at[idx].add(y), self, o)
 
@@ -81,15 +81,15 @@ class Base:
                 fun = getattr(outer_self.__class__, attr)
                 # load the stack from the bottom up
                 vmap_order = reversed(list(zip(self.in_axes, self.out_axes)))
-                for in_axes, out_axes in vmap_order:
-                    fun = vmap(fun, in_axes=in_axes, out_axes=out_axes)
+                for field_in_axes, field_out_axes in vmap_order:
+                    fun = vmap(fun, in_axes=field_in_axes, out_axes=field_out_axes)
                 fun = functools.partial(fun, outer_self)
                 return fun
 
         return VmapField(in_axes, out_axes)
 
     def tree_replace(
-        self, params: Dict[str, Optional[jax.typing.ArrayLike]]
+        self, params: dict[str, jax.typing.ArrayLike | None]
     ) -> 'Base':
         """Creates a new object with parameters set.
 
@@ -118,7 +118,7 @@ class Base:
 def _tree_replace(
     base: Base,
     attr: Sequence[str],
-    val: Optional[jax.typing.ArrayLike],
+    val: jax.typing.ArrayLike | None,
 ) -> Base:
     """Sets attributes in a struct.dataclass with values."""
     if not attr:
@@ -151,5 +151,5 @@ class State(Base):
     obs: jp.ndarray
     reward: jp.ndarray
     done: jp.ndarray
-    metrics: Dict[str, jp.ndarray] = struct.field(default_factory=dict)
-    info: Dict[str, Any] = struct.field(default_factory=dict)
+    metrics: dict[str, jp.ndarray] = struct.field(default_factory=dict)
+    info: dict[str, Any] = struct.field(default_factory=dict)

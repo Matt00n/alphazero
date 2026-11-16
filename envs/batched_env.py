@@ -1,24 +1,23 @@
 import multiprocessing as mp
 import warnings
 from collections import OrderedDict
+from collections.abc import Callable, Sequence
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
+from typing import Any
 
-import jax.numpy as jnp
 import gymnasium as gym
-from gymnasium import spaces
+import jax.numpy as jnp
 import numpy as np
+from gymnasium import spaces
 
 from envs.base import (
     CloudpickleWrapper,
     VecEnv,
     VecEnvIndices,
     VecEnvObs,
-    VecEnvStepReturn,
 )
 from envs.state import State
 from envs.utils import copy_obs_dict, dict_to_obs, obs_space_info
-
 
 
 class SequencedBatchedEnv(VecEnv):
@@ -36,9 +35,9 @@ class SequencedBatchedEnv(VecEnv):
 
     actions: np.ndarray
 
-    def __init__(self, env_fns: List[Callable[[], gym.Env]]):
+    def __init__(self, env_fns: list[Callable[[], gym.Env]]):
         self.envs = [fn() for fn in env_fns]
-        if len(set([id(env.unwrapped) for env in self.envs])) != len(self.envs):
+        if len({id(env.unwrapped) for env in self.envs}) != len(self.envs):
             raise ValueError(
                 "You tried to create multiple environments, but the function to create them returned the same instance "
                 "instead of creating different objects. "
@@ -56,7 +55,7 @@ class SequencedBatchedEnv(VecEnv):
         self.buf_obs = OrderedDict([(k, np.zeros((self.num_envs, *tuple(shapes[k])), dtype=dtypes[k])) for k in self.keys])
         self.buf_dones = np.zeros((self.num_envs,), dtype=bool)
         self.buf_rews = np.zeros((self.num_envs,), dtype=np.float32)
-        self.buf_infos: List[Dict[str, Any]] = [{} for _ in range(self.num_envs)]
+        self.buf_infos: list[dict[str, Any]] = [{} for _ in range(self.num_envs)]
         self.metadata = env.metadata
 
     def step_async(self, actions: np.ndarray) -> None:
@@ -105,7 +104,7 @@ class SequencedBatchedEnv(VecEnv):
         for env in self.envs:
             env.close()
 
-    def get_images(self) -> Sequence[Optional[np.ndarray]]:
+    def get_images(self) -> Sequence[np.ndarray | None]:
         if self.render_mode != "rgb_array":
             warnings.warn(
                 f"The render mode is {self.render_mode}, but this method assumes it is `rgb_array` to obtain images."
@@ -113,7 +112,7 @@ class SequencedBatchedEnv(VecEnv):
             return [None for _ in self.envs]
         return [env.render() for env in self.envs]  # type: ignore[misc]
 
-    def render(self, mode: Optional[str] = None) -> Optional[np.ndarray]:
+    def render(self, mode: str | None = None) -> np.ndarray | None:
         """
         Gym environment rendering. If there are multiple environments then
         they are tiled together in one image via ``BaseVecEnv.render()``.
@@ -132,7 +131,7 @@ class SequencedBatchedEnv(VecEnv):
     def _obs_from_buf(self) -> VecEnvObs:
         return dict_to_obs(self.observation_space, copy_obs_dict(self.buf_obs))
 
-    def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> List[Any]:
+    def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> list[Any]:
         """Return attribute from vectorized environment (see base class)."""
         target_envs = self._get_target_envs(indices)
         return [getattr(env_i, attr_name) for env_i in target_envs]
@@ -143,12 +142,12 @@ class SequencedBatchedEnv(VecEnv):
         for env_i in target_envs:
             setattr(env_i, attr_name, value)
 
-    def env_method(self, method_name: str, *method_args, indices: VecEnvIndices = None, **method_kwargs) -> List[Any]:
+    def env_method(self, method_name: str, *method_args, indices: VecEnvIndices = None, **method_kwargs) -> list[Any]:
         """Call instance methods of vectorized environments."""
         target_envs = self._get_target_envs(indices)
         return [getattr(env_i, method_name)(*method_args, **method_kwargs) for env_i in target_envs]
 
-    def _get_target_envs(self, indices: VecEnvIndices) -> List[gym.Env]:
+    def _get_target_envs(self, indices: VecEnvIndices) -> list[gym.Env]:
         indices = self._get_indices(indices)
         return [self.envs[i] for i in indices]
     
@@ -161,7 +160,7 @@ def _worker(
 ) -> None:
     parent_remote.close()
     env = env_fn_wrapper.var()
-    reset_info: Optional[Dict[str, Any]] = {}
+    reset_info: dict[str, Any] | None = {}
     while True:
         try:
             cmd, data = remote.recv()
@@ -224,7 +223,7 @@ class ParallelBatchedEnv(VecEnv):
            Defaults to 'forkserver' on available platforms, and 'spawn' otherwise.
     """
 
-    def __init__(self, env_fns: List[Callable[[], gym.Env]], start_method: Optional[str] = None):
+    def __init__(self, env_fns: list[Callable[[], gym.Env]], start_method: str | None = None):
         self.waiting = False
         self.closed = False
         n_envs = len(env_fns)
@@ -292,7 +291,7 @@ class ParallelBatchedEnv(VecEnv):
             process.join()
         self.closed = True
 
-    def get_images(self) -> Sequence[Optional[np.ndarray]]:
+    def get_images(self) -> Sequence[np.ndarray | None]:
         if self.render_mode != "rgb_array":
             warnings.warn(
                 f"The render mode is {self.render_mode}, but this method assumes it is `rgb_array` to obtain images."
@@ -304,7 +303,7 @@ class ParallelBatchedEnv(VecEnv):
         outputs = [pipe.recv() for pipe in self.remotes]
         return outputs
 
-    def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> List[Any]:
+    def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> list[Any]:
         """Return attribute from vectorized environment (see base class)."""
         target_remotes = self._get_target_remotes(indices)
         for remote in target_remotes:
@@ -319,14 +318,14 @@ class ParallelBatchedEnv(VecEnv):
         for remote in target_remotes:
             remote.recv()
 
-    def env_method(self, method_name: str, *method_args, indices: VecEnvIndices = None, **method_kwargs) -> List[Any]:
+    def env_method(self, method_name: str, *method_args, indices: VecEnvIndices = None, **method_kwargs) -> list[Any]:
         """Call instance methods of vectorized environments."""
         target_remotes = self._get_target_remotes(indices)
         for remote in target_remotes:
             remote.send(("env_method", (method_name, method_args, method_kwargs)))
         return [remote.recv() for remote in target_remotes]
 
-    def _get_target_remotes(self, indices: VecEnvIndices) -> List[Any]:
+    def _get_target_remotes(self, indices: VecEnvIndices) -> list[Any]:
         """
         Get the connection object needed to communicate with the wanted
         envs that are in subprocesses.
@@ -338,7 +337,7 @@ class ParallelBatchedEnv(VecEnv):
         return [self.remotes[i] for i in indices]
 
 
-def _flatten_obs(obs: Union[List[VecEnvObs], Tuple[VecEnvObs]], space: spaces.Space) -> VecEnvObs:
+def _flatten_obs(obs: list[VecEnvObs] | tuple[VecEnvObs], space: spaces.Space) -> VecEnvObs:
     """
     Flatten observations, depending on the observation space.
 
@@ -355,7 +354,7 @@ def _flatten_obs(obs: Union[List[VecEnvObs], Tuple[VecEnvObs]], space: spaces.Sp
     if isinstance(space, spaces.Dict):
         assert isinstance(space.spaces, OrderedDict), "Dict space must have ordered subspaces"
         assert isinstance(obs[0], dict), "non-dict observation for environment with Dict observation space"
-        return OrderedDict([(k, np.stack([o[k] for o in obs])) for k in space.spaces.keys()])
+        return OrderedDict([(k, np.stack([o[k] for o in obs])) for k in space.spaces])
     elif isinstance(space, spaces.Tuple):
         assert isinstance(obs[0], tuple), "non-tuple observation for environment with Tuple observation space"
         obs_len = len(space.spaces)

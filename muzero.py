@@ -1,11 +1,17 @@
-"""AlphaZero reimplementation."""
+"""MuZero reimplementation in JAX / MCTX.
+
+Consolidated from the step-by-step ablation in muzero_ablate.py (which keeps the
+full history of every change, flagged with ### tags). See the README for the
+recommended settings, results on Acrobot and notes on hyperparameter tuning.
+"""
 
 import os
 import pickle
 import random
 import time
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
-from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any
 
 import chex
 import flax
@@ -21,12 +27,9 @@ import mctx_dist as mctx
 import replay_buffers
 import running_statistics
 from envs import (
-    MCTSTransition,
     MuZeroTransition,
-    Transition,
     has_discrete_action_space,
     is_atari_env,
-    make_env,
 )
 
 # from envs.brax_v1_wrappers import wrap_for_training
@@ -42,7 +45,6 @@ from networks.distributions import (
 from networks.networks import (
     ActivationFn,
     FeedForwardNetwork,
-    make_atari_feature_extractor,
     make_dynamics_network,
     make_policy_network,
     make_representation_function,
@@ -50,25 +52,11 @@ from networks.networks import (
 )
 from networks.policy import BaseDynamicsFn, BaseRepresentationFn, ForwardPass, Policy
 
-# os.environ[
-#     "XLA_PYTHON_CLIENT_MEM_FRACTION"
-# ] = "0.7"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
-
-
-# TODO normalization of embeddings
-# TODO loss function (unrolls)
-# TODO loss coefficients
-# TODO reanalyze
-# TODO optional self-consistency loss (see efficientZero)
-# TODO distributional loss for reward
-# TODO loss function metrics
-# TODO IMPORTANT!! unroll mask needs to respect episodes as well, set to zero upon done
-
 
 class Config:
     # experiment
     experiment_name = "base_short"
-    seed = 20
+    seed = 22
     platform = "cpu"  # CPU or GPU
     capture_video = False
     write_logs_to_file = False
@@ -82,78 +70,125 @@ class Config:
     action_repeat = 1
     eval_env = True
     num_resets_per_eval = 0
-    eval_every = 5
+    eval_every = 20
     deterministic_eval = True
     num_eval_envs = 64
     episode_length = 500
 
     # MCTS
-    num_simulations = 30
-    max_num_considered_actions = 16
-    l2_coef = 1e-4  # 1e-4
-    vf_cost = 0.5
-    use_gae = False
+    num_simulations = 50  # 100 is slightly better and twice as slow
+    max_num_considered_actions = 16  # only used by the Gumbel search (see run_search)
+    # Search on the learned model (MuZero). False: oracle ablation, the search
+    # runs on the true environment (AlphaZero-style), the networks are unchanged.
+    learned_dynamics_search: bool = True
+
+    # value targets: GAE(lambda) over the stored MCTS search values (as in
+    # alphazero.py). use_gae = False -> n-step returns bootstrapped from the stored
+    # search values (NOTE: the n-step path still treats time limits as terminal).
+    use_gae = True
     gae_lambda = 0.95
-    n_step_gamma = 0.99  # 0.99
+    n_step_gamma = 0.99
     n_step_n = 5
 
-    # quantile regression
-    num_atoms: int = (
-        1  # 8 # NOTE: num_atoms = 1 yields non-distributional RL with MSE loss
-    )
+    # value head (mutually exclusive options):
+    #   categorical_value = False, num_atoms = 1  -> scalar head, MSE loss
+    #   categorical_value = False, num_atoms > 1  -> quantile-regression head with
+    #       num_atoms quantiles, quantile Huber loss (kappa = qr_kappa), as in
+    #       AlphaTensor. The search uses the quantile mean. Best on Acrobot.
+    #   categorical_value = True                  -> categorical head, two-hot
+    #       cross-entropy over the support below (MuZero Appendix F).
+    num_atoms: int = 8
     qr_kappa: float = 1.0
+    categorical_value: bool = False
+    # categorical supports: range (+-max, in h-space) and atom spacing.
+    # None -> MuZero's Atari support: 601 integer atoms (+-300, step 1).
+    # Acrobot: |V| <= ~120 -> h in [-10, 10]; rewards {-1, 0} -> h in [-0.42, 0].
+    value_support_max: float | None = 10.0  # only used if categorical_value
+    value_support_step: float = 0.25  # -> 81 atoms
+    reward_support_max: float | None = None  # None = 601 atoms
+    reward_support_step: float = 0.25  # e.g. reward_support_max=2.0 -> 17 atoms
+    # False -> MuZero: two-hot in h-space, decoded as h^-1(E[i]); biased towards
+    # smaller |V| under noisy targets (Jensen). True -> DreamerV3-style: same
+    # atoms, two-hot and decoding in raw value space (unbiased mean).
+    value_raw_space_twohot: bool = False
 
-    loss_unroll_length: int = 5
-
-    # ### PORTED FROM muzero_ablate (BOTTOM-UP STEP 2b): MuZero gradient scaling ###
-    # Gradient through each recurrent hidden state fed into the next dynamics call
-    # is scaled by this factor (MuZero pseudocode: scale_gradient(hidden_state, 0.5)).
-    # 1.0 = off (previous behaviour, exact identity).
+    # unrolled loss
+    loss_unroll_length: int = 5  # predictions at k = 0..U-1
+    # gradient through each recurrent hidden state fed into the next dynamics
+    # call is scaled by this factor (MuZero: scale_gradient(hidden_state, 0.5))
     dynamics_gradient_scale: float = 0.5
+    # weight of -cos(predicted embedding, stop_grad(representation(real obs)))
+    # for unroll steps k >= 1 (EfficientZero uses 2.0, there with an extra
+    # projection head). Not part of the original MuZero.
+    consistency_loss_coef: float = 0.0
+    vf_cost = 0.5
+    l2_coef = 1e-4  # L2 on weight matrices only (not on biases / LayerNorm)
 
-    # ### PORTED FROM muzero_ablate (BOTTOM-UP STEP 2c): MuZero per-step loss weights ###
-    # True:  policy/value loss weight 1 at k=0 and 1/K for each recurrent step k>=1
-    #        (normalised), as in the MuZero pseudocode.
-    # False: uniform mean over unroll steps (previous behaviour).
-    muzero_loss_weighting: bool = True
+    # evaluation: eval/* acts with the most visited root action and no root
+    # Dirichlet noise (MuZero). eval_argmax_q = True additionally evaluates with
+    # argmax Q over visited root actions and root noise, logged as eval_argmax_q/*.
+    eval_argmax_q: bool = False
+    # True: at each eval, play episodes with the learned-model search and also run
+    # the true-environment search from the same states; logs diag/* (agreement,
+    # regret, root Q errors, goal detection, value drift k=1..8, tree depth).
+    # Eval only, roughly doubles eval time.
+    planning_diagnostics: bool = False
 
     # reanalyze
     reanalyze: bool = False
 
     # replay buffer
     min_replay_size: int = 8192
-    max_replay_size: Optional[int] = 8192  # 8192 # 16384
-    replay_buffer_batch_size: int = 256  # 256
-    per_alpha: float = 0.0
+    max_replay_size: int | None = 32768
+    replay_buffer_batch_size: int = 128
+    # priority = (|value error| + per_reward_priority_weight * |reward error|
+    #             + per_epsilon) ** per_alpha
+    # (reward error = one-step reward prediction error of the model; it lets the
+    # agent bootstrap from rare goal transitions). IS weights are normalised
+    # within the sampled batch and scale the whole loss.
+    per_alpha: float = 0.6
     per_importance_sampling: bool = True
-    per_importance_sampling_beta: float = 1.0
+    per_importance_sampling_beta: float = 0.4  # used if per_beta_anneal = False
+    per_epsilon: float = 1e-6
+    per_reward_priority_weight: float = 1.0
+    # anneal the IS exponent beta from per_beta_start to per_beta_end over
+    # training (EfficientZero: alpha 0.6, beta 0.4 -> 1)
+    per_beta_anneal: bool = True
+    per_beta_start: float = 0.4
+    per_beta_end: float = 1.0
 
     # algorithm hyperparameters
     total_timesteps = int(1e6)
-    learning_rate = 1e-3  # 3e-4
-    unroll_length = 128  # 512 # 128
+    learning_rate = 1e-3
+    unroll_length = 128
+    # lr schedules count optimizer updates (not env steps).
+    # late_lr_decay: constant lr for the first lr_decay_start_frac of the updates,
+    # then linear decay to 1%. Otherwise, anneal_lr: linear decay to 1% over all
+    # updates (can freeze a suboptimal strategy); else constant.
+    late_lr_decay: bool = True
+    lr_decay_start_frac: float = 0.8
     anneal_lr = True
-    num_minibatches = 128  # 64
+    num_minibatches = 128
     update_epochs = (
         1  # NOTE: no reason to increase this, just increase sample size instead
     )
-    max_grad_norm = 0.5
+    max_grad_norm = 50  # safety net; 0.5 clipped almost every update
 
     # policy params
-    embedding_size: int = 64  # 64
-    policy_hidden_layer_sizes: Sequence[int] = (32,) * 2  # (32,) * 4
-    value_hidden_layer_sizes: Sequence[int] = (256,) * 3  # (256,) * 5
-    representation_hidden_layer_sizes: Sequence[int] = (64,) * 2  # (32,) * 2
-    reward_hidden_layer_sizes: Sequence[int] = (64,) * 2  # (64,) * 2
-    nstate_hidden_layer_sizes: Sequence[int] = (64,) * 2  # (64,) * 2
+    embedding_size: int = 64
+    policy_hidden_layer_sizes: Sequence[int] = (32,) * 4
+    value_hidden_layer_sizes: Sequence[int] = (256,) * 5
+    representation_hidden_layer_sizes: Sequence[int] = (64,) * 2
+    reward_hidden_layer_sizes: Sequence[int] = (64,) * 2
+    nstate_hidden_layer_sizes: Sequence[int] = (64,) * 2
     activation: ActivationFn = nn.swish
     squash_distribution: bool = True
 
     # atari params
-    atari_dense_layer_sizes: Sequence[int] = (256,)  # (512,)
+    atari_dense_layer_sizes: Sequence[int] = (256,)
 
 
-InferenceParams = Tuple[running_statistics.NestedMeanStd, Any]  # Not used
+InferenceParams = tuple[running_statistics.NestedMeanStd, Any]  # Not used
 Metrics = Mapping[str, jnp.ndarray]
 ReplayBufferState = Any
 
@@ -190,7 +225,7 @@ class AZNetworks:
     value_network: FeedForwardNetwork
     representation_network: FeedForwardNetwork
     dynamics_network: FeedForwardNetwork
-    parametric_action_distribution: Union[ParametricDistribution, DiscreteDistribution]
+    parametric_action_distribution: ParametricDistribution | DiscreteDistribution
 
 
 @flax.struct.dataclass
@@ -207,7 +242,7 @@ class AtariAZNetworks:
     feature_extractor: FeedForwardNetwork
     policy_network: FeedForwardNetwork
     value_network: FeedForwardNetwork
-    parametric_action_distribution: Union[ParametricDistribution, DiscreteDistribution]
+    parametric_action_distribution: ParametricDistribution | DiscreteDistribution
 
 
 @flax.struct.dataclass
@@ -215,12 +250,12 @@ class TrainingState:
     """Contains training state for the learner."""
 
     optimizer_state: optax.OptState
-    params: Union[AZNetworkParams, AtariAZNetworkParams]
+    params: AZNetworkParams | AtariAZNetworkParams
     normalizer_params: running_statistics.RunningStatisticsState
     env_steps: jnp.ndarray
 
 
-def make_inference_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
+def make_inference_fn(az_networks: AZNetworks | AtariAZNetworks):
     """Creates params and inference function for the agent."""
 
     def make_policy(
@@ -237,7 +272,7 @@ def make_inference_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
         @jax.jit  # TODO jit needed ?
         def policy(
             observations: jnp.ndarray, key_sample: jnp.ndarray
-        ) -> Tuple[jnp.ndarray, Mapping[str, Any]]:
+        ) -> tuple[jnp.ndarray, Mapping[str, Any]]:
             if use_feature_extractor:
                 observations = shared_feature_extractor.apply(
                     normalizer_params, feature_extractor_params, observations
@@ -264,7 +299,7 @@ def make_inference_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
     return make_policy
 
 
-def make_forward_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
+def make_forward_fn(az_networks: AZNetworks | AtariAZNetworks):
     """Creates params and inference function for the agent."""
 
     def make_forward(
@@ -282,7 +317,7 @@ def make_forward_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
         @jax.jit  # TODO jit needed ?
         def forward_networks(
             observations: jnp.ndarray,
-        ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        ) -> tuple[jnp.ndarray, jnp.ndarray]:
             if use_feature_extractor:
                 observations = shared_feature_extractor.apply(
                     normalizer_params, feature_extractor_params, observations
@@ -292,10 +327,10 @@ def make_forward_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
                 normalizer_params, policy_params, observations
             )
             value = value_network.apply(normalizer_params, value_params, observations)
-            # value = inverse_scalar_transform(value) # VALUE TEST logits_to_scalar_expectation
-            value = logits_to_scalar_expectation(
-                value
-            )  # VALUE TEST logits_to_scalar_expectation
+            # categorical head: decode the logits to a scalar value; scalar and
+            # quantile heads output values directly
+            if Config.categorical_value:
+                value = decode_value_logits(value)
 
             return logits, value
 
@@ -304,7 +339,7 @@ def make_forward_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
     return make_forward
 
 
-def make_representation_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
+def make_representation_fn(az_networks: AZNetworks | AtariAZNetworks):
     """Creates params and inference function for the agent."""
 
     def make_representation(params: Any) -> BaseRepresentationFn:
@@ -314,7 +349,7 @@ def make_representation_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
         @jax.jit  # TODO jit needed ?
         def representation_fn(
             observations: jnp.ndarray,
-        ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        ) -> tuple[jnp.ndarray, jnp.ndarray]:
             hidden_state = representation_network.apply(
                 normalizer_params, representation_params, observations
             )
@@ -325,7 +360,7 @@ def make_representation_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
     return make_representation
 
 
-def make_dynamics_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
+def make_dynamics_fn(az_networks: AZNetworks | AtariAZNetworks):
     """Creates params and inference function for the agent."""
 
     def make_dynamics(params: Any) -> BaseDynamicsFn:
@@ -335,14 +370,14 @@ def make_dynamics_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
         @jax.jit  # TODO jit needed ?
         def dynamics_fn(
             observations: jnp.ndarray, actions: jnp.ndarray
-        ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        ) -> tuple[jnp.ndarray, jnp.ndarray]:
             reward, hidden_state = dynamics_network.apply(
                 normalizer_params, dynamics_params, observations, actions
             )
-            # reward = inverse_scalar_transform(reward) # get expected value of distributional reward estimate logits_to_scalar_expectation
+            # decode the categorical reward head: h^-1(E[i])
             reward = logits_to_scalar_expectation(
-                reward
-            )  # get expected value of distributional reward estimate logits_to_scalar_expectation
+                reward, support_max=reward_support()[1]
+            )
             return jnp.mean(reward, axis=-1), hidden_state
 
         return dynamics_fn
@@ -351,7 +386,7 @@ def make_dynamics_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
 
 
 def make_az_networks(
-    observation_size: Union[Sequence[int], int],
+    observation_size: Sequence[int] | int,
     embedding_size: int,
     action_size: int,
     num_atoms: int,
@@ -365,9 +400,13 @@ def make_az_networks(
     sqash_distribution: bool = True,
     discrete_policy: bool = False,
     shared_feature_extractor: bool = False,
-    feature_extractor_dense_hidden_layer_sizes: Optional[Sequence[int]] = (512,),
-) -> Union[AZNetworks, AtariAZNetworkParams]:
+    feature_extractor_dense_hidden_layer_sizes: Sequence[int] | None = (512,),
+) -> AZNetworks | AtariAZNetworkParams:
     """Make networks with preprocessor."""
+    # categorical and quantile heads are mutually exclusive
+    assert not (Config.categorical_value and Config.num_atoms > 1), (
+        "categorical_value requires num_atoms == 1 (num_atoms > 1 = QR head)"
+    )
     if discrete_policy:
         parametric_action_distribution = DiscreteDistribution(param_size=action_size)
     elif sqash_distribution:
@@ -376,6 +415,8 @@ def make_az_networks(
         parametric_action_distribution = PolicyNormalDistribution(
             event_size=action_size
         )
+    # representation: MLP with LayerNorm output; policy / value / dynamics
+    # operate on the embedding
     representation_network = make_representation_function(
         obs_size=observation_size,
         embedding_dim=embedding_size,
@@ -383,10 +424,11 @@ def make_az_networks(
         hidden_layer_sizes=representation_hidden_layer_sizes,
         activation=activation,
     )
+    hidden_size = (embedding_size,)
     dynamics_network = make_dynamics_network(
-        embedding_size=embedding_size,
+        embedding_size=hidden_size[0],
         num_actions=action_size,
-        num_reward_atoms=601,  # TODO get as input
+        num_reward_atoms=reward_support()[0],
         preprocess_observation_fn=lambda x, y: x,
         hidden_layer_sizes_reward=reward_hidden_layer_sizes,
         hidden_layer_sizes_next_state=nstate_hidden_layer_sizes,
@@ -394,14 +436,16 @@ def make_az_networks(
     )
     policy_network = make_policy_network(
         parametric_action_distribution.param_size,
-        (embedding_size,),
+        hidden_size,
         preprocess_observation_fn=lambda x, y: x,
         hidden_layer_sizes=policy_hidden_layer_sizes,
         activation=activation,
     )
     value_network = make_value_network(
-        (embedding_size,),
-        num_atoms=601,  # value test
+        hidden_size,
+        # categorical: one logit per atom; otherwise num_atoms quantiles
+        # (1 = scalar MSE head)
+        num_atoms=value_support()[0] if Config.categorical_value else Config.num_atoms,
         preprocess_observation_fn=lambda x, y: x,
         hidden_layer_sizes=value_hidden_layer_sizes,
         activation=activation,
@@ -416,6 +460,118 @@ def make_az_networks(
     )
 
 
+# Search construction is shared by actor_step and the planning diagnostics,
+# which run the model-based and the true-environment search on the same states.
+def run_search(
+    env_state: State,
+    root_embedding: jnp.ndarray,
+    prior_logits: jnp.ndarray,
+    value: jnp.ndarray,
+    forward: ForwardPass,
+    representation_fn: BaseRepresentationFn,
+    dynamics_fn: BaseDynamicsFn,
+    rollout_env: Any,
+    search_rng: jnp.ndarray,
+    use_learned_model: bool,
+    dirichlet_fraction: float,
+):
+    """Runs MCTS on the learned model (MuZero) or on the true env (oracle)."""
+    # use_learned_model = True -> MuZero search: root embedding =
+    # representation(obs), leaves via the learned dynamics network, discount =
+    # gamma everywhere (the model has no terminal signal; after a real
+    # termination it is trained on absorbing states with reward 0).
+    # False -> oracle: the search runs on the true environment.
+    if use_learned_model:
+        root = mctx.RootFnOutput(
+            prior_logits=prior_logits,
+            value=value,
+            embedding=root_embedding,
+        )
+
+        def recurrent_fn(params, rng_key, action, embedding):
+            # environment (model)
+            reward, nstate = dynamics_fn(embedding, action)
+
+            # policy & value networks
+            prior_logits, value = forward(nstate)
+
+            # Create the new MCTS node.
+            recurrent_fn_output = mctx.RecurrentFnOutput(
+                reward=reward,
+                # no terminal prediction: constant discount
+                discount=Config.n_step_gamma * jnp.ones_like(reward),
+                # prior for the new state
+                prior_logits=prior_logits,
+                # value for the new state
+                value=value,
+            )
+
+            # Return the new node and the new hidden state.
+            return recurrent_fn_output, nstate
+
+    else:
+        root = mctx.RootFnOutput(
+            prior_logits=prior_logits,
+            value=value,
+            # The embedding is used only to implement the MuZero model.
+            embedding=env_state,
+        )
+
+        def recurrent_fn(params, rng_key, action, embedding):
+            # environment (model)
+            env_state = embedding
+            nstate = rollout_env.step(env_state, action)
+
+            # policy & value networks
+            embedding = representation_fn(nstate.obs)
+            prior_logits, value = forward(embedding)
+
+            # Create the new MCTS node.
+            recurrent_fn_output = mctx.RecurrentFnOutput(
+                reward=nstate.reward,
+                # discount when terminal state reached
+                discount=Config.n_step_gamma
+                * jnp.where(
+                    nstate.info["truncation"],
+                    jnp.ones_like(nstate.done),
+                    1 - nstate.done,
+                ),
+                # prior for the new state
+                prior_logits=prior_logits,
+                # value for the new state
+                value=value,
+            )
+
+            # Return the new node and the new environment.
+            return recurrent_fn_output, nstate
+
+    # Running the search (alternative: Gumbel MuZero).
+    # policy_output = mctx.gumbel_muzero_policy(
+    #     params=(),
+    #     rng_key=search_rng,
+    #     root=root,
+    #     recurrent_fn=recurrent_fn,
+    #     num_simulations=Config.num_simulations,
+    #     max_num_considered_actions=Config.max_num_considered_actions,
+    #     qtransform=partial(
+    #         mctx.qtransform_completed_by_mix_value,
+    #         use_mixed_value=False),
+    # )
+
+    return mctx.sampled_muzero_policy(  # muzero_policy
+        params=(),
+        rng_key=search_rng,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=Config.num_simulations,
+        dirichlet_fraction=dirichlet_fraction,
+        dirichlet_alpha=0.3,
+        pb_c_init=1.25,
+        pb_c_base=19652,
+        temperature=1.0,
+    )
+
+
 def actor_step(
     env: GymnaxToBraxWrapper,
     rollout_env: Any,
@@ -426,127 +582,65 @@ def actor_step(
     key: jnp.ndarray,
     deterministic_actions: bool = False,
     extra_fields: Sequence[str] = (),
-) -> Tuple[State, MuZeroTransition]:
+    # deterministic action: most visited root action and no root noise (MuZero)
+    # instead of argmax Q
+    visit_count_actions: bool = False,
+) -> tuple[State, MuZeroTransition]:
     """Collect data."""
 
-    key, logits_rng, search_rng = jax.random.split(key, 3)
+    key, _logits_rng, search_rng = jax.random.split(key, 3)  # (keeps the rng streams)
 
     # logits at root produced by the prior policy
     root_embedding = representation_fn(env_state.obs)
     prior_logits, value = forward(root_embedding)
 
-    use_mixed_value = False
-
-    # NOTE: For AlphaZero embedding is env_state, for MuZero
-    # the root output would be the output of MuZero representation network.
-    root = mctx.RootFnOutput(
-        prior_logits=prior_logits,
-        value=value,
-        # The embedding is used only to implement the MuZero model.
-        embedding=root_embedding,
-    )
-
-    # The recurrent_fn is provided by MuZero dynamics network.
-    # Or true environment for AlphaZero
-    def recurrent_fn(params, rng_key, action, embedding):
-        # environment (model)
-        reward, nstate = dynamics_fn(embedding, action)
-
-        # policy & value networks
-        prior_logits, value = forward(nstate)  # priorly: env_state
-
-        # Create the new MCTS node.
-        recurrent_fn_output = mctx.RecurrentFnOutput(
-            reward=reward,
-            # discount when terminal state reached
-            discount=Config.n_step_gamma * jnp.ones_like(reward),
-            # prior for the new state
-            prior_logits=prior_logits,
-            # value for the new state
-            value=value,
-        )
-
-        # Return the new node and the new environment.
-        return recurrent_fn_output, nstate
-
-    ################################
-
-    # # TODO: AlphaZero style for oracle test, remove again
-    # root = mctx.RootFnOutput(
-    #     prior_logits=prior_logits,
-    #     value=value,
-    #     # The embedding is used only to implement the MuZero model.
-    #     embedding=env_state,
-    # )
-
-    # def recurrent_fn(params, rng_key, action, embedding):
-    #     # environment (model)
-    #     env_state = embedding
-    #     nstate = rollout_env.step(env_state, action)
-
-    #     # policy & value networks
-    #     embedding = representation_fn(nstate.obs)
-    #     prior_logits, value = forward(embedding)  # priorly: env_state
-
-    #     # Create the new MCTS node.
-    #     recurrent_fn_output = mctx.RecurrentFnOutput(
-    #         reward=nstate.reward,
-    #         # discount when terminal state reached
-    #         discount=Config.n_step_gamma
-    #         * jnp.where(
-    #             nstate.info["truncation"], jnp.ones_like(nstate.done), 1 - nstate.done
-    #         ),  # 1 - nstate.done,
-    #         # prior for the new state
-    #         prior_logits=prior_logits,
-    #         # value for the new state
-    #         value=value,
-    #     )
-
-    #     # Return the new node and the new environment.
-    #     return recurrent_fn_output, nstate
-
-    ################################
-
-    # Running the search.
-    # policy_output = mctx.gumbel_muzero_policy(
-    #     params=(),
-    #     rng_key=search_rng,
-    #     root=root,
-    #     recurrent_fn=recurrent_fn,
-    #     num_simulations=Config.num_simulations,
-    #     max_num_considered_actions=Config.max_num_considered_actions,
-    #     qtransform=partial(
-    #         mctx.qtransform_completed_by_mix_value,
-    #         use_mixed_value=use_mixed_value),
-    # )
-
-    policy_output = mctx.sampled_muzero_policy(  # muzero_policy
-        params=(),
-        rng_key=search_rng,
-        root=root,
-        recurrent_fn=recurrent_fn,
-        num_simulations=Config.num_simulations,
-        dirichlet_fraction=0.25,
-        dirichlet_alpha=0.3,
-        pb_c_init=1.25,  # 1.25,
-        pb_c_base=19652,  # 19652,
-        temperature=1.0,
+    policy_output = run_search(
+        env_state,
+        root_embedding,
+        prior_logits,
+        value,
+        forward,
+        representation_fn,
+        dynamics_fn,
+        rollout_env,
+        search_rng,
+        use_learned_model=Config.learned_dynamics_search,
+        dirichlet_fraction=0.0 if visit_count_actions else 0.25,
     )
 
     actions = policy_output.action
     action_weights = policy_output.action_weights
-    # best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
     qvalues = jnp.mean(policy_output.search_tree.summary().qvalues, axis=-1)
     masked_qvalues = jnp.where(action_weights, qvalues, -jnp.inf)
-    best_actions = jnp.argmax(masked_qvalues, axis=-1).astype(jnp.int32)
+    if visit_count_actions:
+        best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
+    else:
+        best_actions = jnp.argmax(masked_qvalues, axis=-1).astype(jnp.int32)
     actions = jax.lax.select(deterministic_actions, best_actions, actions)
 
     search_value = policy_output.search_tree.summary().value
-    # search_value = policy_output.search_tree.summary().qvalues[jnp.arange(actions.shape[0]), actions, :]
+
+    # search diagnostics (logged as training/search_*)
+    # search_entropy: entropy of the search policy (action_weights)
+    # prior_entropy:  entropy of the prior policy at the root
+    # root_q_spread:  max - min root Q over visited actions
+    root_visit_counts = policy_output.search_tree.summary().visit_counts
+    visited = root_visit_counts > 0
+    search_entropy = -jnp.sum(
+        jnp.where(action_weights > 0, action_weights * jnp.log(action_weights), 0.0),
+        axis=-1,
+    )
+    prior_entropy = tfd.Categorical(logits=prior_logits).entropy()
+    root_q_spread = jnp.max(jnp.where(visited, qvalues, -jnp.inf), axis=-1) - jnp.min(
+        jnp.where(visited, qvalues, jnp.inf), axis=-1
+    )
 
     policy_extras = {
         "prior_log_prob": tfd.Categorical(logits=prior_logits).log_prob(actions),
         "raw_action": actions,
+        "search_entropy": search_entropy,
+        "prior_entropy": prior_entropy,
+        "root_q_spread": root_q_spread,
     }
 
     nstate = env.step(env_state, actions)
@@ -607,7 +701,8 @@ def generate_unroll(
     unroll_length: int,
     deterministic_actions: bool = False,
     extra_fields: Sequence[str] = (),
-) -> Tuple[State, MuZeroTransition]:
+    visit_count_actions: bool = False,
+) -> tuple[State, MuZeroTransition]:
     """Collect trajectories of given unroll_length."""
 
     @jax.jit
@@ -624,6 +719,7 @@ def generate_unroll(
             current_key,
             deterministic_actions=deterministic_actions,
             extra_fields=extra_fields,
+            visit_count_actions=visit_count_actions,
         )
         return (nstate, next_key), transition
 
@@ -646,6 +742,7 @@ class Evaluator:
         action_repeat: int,
         key: jnp.ndarray,
         deterministic_eval: bool = True,
+        visit_count_actions: bool = True,
     ):
         """Init.
 
@@ -657,6 +754,8 @@ class Evaluator:
             action_repeat: Number of physics steps per env step.
             key: RNG key.
             deterministic_eval: whether to choose actions deterministically.
+            visit_count_actions: deterministic action = most visited root action
+                without root noise (True, MuZero) or argmax Q with root noise.
         """
         self._key = key
         self._eval_walltime = 0.0
@@ -693,6 +792,7 @@ class Evaluator:
                 key,
                 unroll_length=episode_length // action_repeat,
                 deterministic_actions=deterministic_eval,
+                visit_count_actions=visit_count_actions,
             )[0]
 
         self._generate_eval_unroll = jax.jit(generate_eval_unroll)
@@ -730,6 +830,240 @@ class Evaluator:
         metrics = {"eval/walltime": self._eval_walltime, **training_metrics, **metrics}
 
         return metrics  # pytype: disable=bad-return-type  # jax-ndarray
+
+
+# Planning diagnostics (Config.planning_diagnostics): eval-only, no effect on
+# training. Plays episodes acting with the LEARNED-MODEL search (most visited
+# action, no root noise, like eval/*) and, from the same real state at
+# every step, also runs the TRUE-ENVIRONMENT (oracle) search. Logged as diag/*:
+#   action_agreement      fraction of steps where both searches pick the same action
+#   oracle_regret         oracle Q(oracle's action) - oracle Q(model's action)
+#   root_q_abs_err/bias   model root Q vs oracle root Q (actions visited in both)
+#   root_value_diff       model root search value - oracle root search value
+#   goal_recall/precision one-step reward model on the real embedding: predicted
+#                         reward > -0.5 vs real termination (goal, reward 0)
+#   reward_pred_goal/other mean predicted reward on goal / other transitions
+#   value_drift_k{k}      |V(k-step predicted embedding) - V(real embedding k
+#                         steps later)| along the real trajectory, k = 1..8
+#                         (training unrolls k <= loss_unroll_length - 1)
+#   tree_depth_max/mean   depth (dynamics steps) of the learned-model search
+#                         tree; mean over expanded non-root nodes
+#   tree_frac_beyond_unroll fraction of expanded nodes deeper than the
+#                         trained unroll (depth > loss_unroll_length - 1)
+# Only steps of the first episode per env are counted.
+def tree_depth_stats(
+    tree: Any, max_trained_depth: int
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Per-env (max depth, mean depth of expanded non-root nodes, fraction of
+    expanded non-root nodes deeper than max_trained_depth). Node depth = number
+    of dynamics steps from the root embedding. mctx allocates nodes in order, so
+    parents[i] < i and one pass over the node axis suffices."""
+    parents = tree.parents  # [B, N], NO_PARENT = -1 for root / unused nodes
+    num_nodes = parents.shape[1]
+    depth = jnp.zeros_like(parents)
+    for i in range(1, num_nodes):
+        p = parents[:, i]
+        parent_depth = jnp.take_along_axis(depth, jnp.maximum(p, 0)[:, None], 1)[:, 0]
+        depth = depth.at[:, i].set(jnp.where(p >= 0, parent_depth + 1, 0))
+    expanded = (tree.node_visits > 0) & (parents >= 0)  # non-root, visited
+    n = jnp.maximum(jnp.sum(expanded, axis=1), 1)
+    max_depth = jnp.max(jnp.where(expanded, depth, 0), axis=1)
+    mean_depth = jnp.sum(jnp.where(expanded, depth, 0), axis=1) / n
+    frac_beyond = jnp.sum(expanded & (depth > max_trained_depth), axis=1) / n
+    return max_depth, mean_depth, frac_beyond
+
+
+class PlanningDiagnostics:
+    """Compares learned-model search against true-environment search."""
+
+    def __init__(
+        self,
+        eval_env: GymnaxToBraxWrapper,
+        rollout_env: Any,
+        make_forward: Callable,
+        make_representation: Callable,
+        make_dynamics: Callable,
+        num_envs: int,
+        episode_length: int,
+        key: jnp.ndarray,
+        max_drift_steps: int = 8,
+    ):
+        self._key = key
+
+        def run(policy_params: Any, key: jnp.ndarray) -> Mapping[str, jnp.ndarray]:
+            (
+                normalizer_params,
+                policy_p,
+                value_p,
+                feature_extractor_p,
+                representation_p,
+                dynamics_p,
+            ) = policy_params
+            forward = make_forward(
+                (jnp.zeros(1), policy_p, value_p, feature_extractor_p)
+            )
+            representation_fn = make_representation(
+                (normalizer_params, representation_p)
+            )
+            dynamics_fn = make_dynamics((jnp.zeros(1), dynamics_p))
+
+            reset_key, unroll_key = jax.random.split(key)
+            state0 = eval_env.reset(jax.random.split(reset_key, num_envs))
+
+            def step(carry, step_key):
+                state, active = carry
+                key_model, key_oracle = jax.random.split(step_key)
+                root_embedding = representation_fn(state.obs)
+                prior_logits, value = forward(root_embedding)
+                searches = {}
+                for name, use_model, k in (
+                    ("model", True, key_model),
+                    ("oracle", False, key_oracle),
+                ):
+                    out = run_search(
+                        state,
+                        root_embedding,
+                        prior_logits,
+                        value,
+                        forward,
+                        representation_fn,
+                        dynamics_fn,
+                        rollout_env,
+                        k,
+                        use_learned_model=use_model,
+                        dirichlet_fraction=0.0,
+                    )
+                    summary = out.search_tree.summary()
+                    if use_model:  # depth of the learned-model search tree
+                        depth_max, depth_mean, depth_frac_beyond = tree_depth_stats(
+                            out.search_tree, Config.loss_unroll_length - 1
+                        )
+                    searches[name] = (
+                        jnp.argmax(out.action_weights, axis=-1).astype(jnp.int32),
+                        jnp.mean(summary.qvalues, axis=-1),  # [B, A]
+                        summary.visit_counts > 0,  # [B, A]
+                        jnp.reshape(summary.value, (num_envs, -1)).mean(axis=-1),
+                    )
+                a_m, q_m, vis_m, v_m = searches["model"]
+                a_o, q_o, vis_o, v_o = searches["oracle"]
+
+                both = vis_m & vis_o
+                n_both = jnp.maximum(jnp.sum(both, axis=-1), 1)
+                q_abs_err = (
+                    jnp.sum(jnp.where(both, jnp.abs(q_m - q_o), 0.0), -1) / n_both
+                )
+                q_bias = jnp.sum(jnp.where(both, q_m - q_o, 0.0), -1) / n_both
+                # regret w.r.t. the oracle's own choice (its most visited action),
+                # measured with oracle Q; 0 when both searches pick the same action
+                q_o_oracle_action = jnp.take_along_axis(q_o, a_o[:, None], -1)[:, 0]
+                q_o_model_action = jnp.take_along_axis(q_o, a_m[:, None], -1)[:, 0]
+                regret_valid = jnp.take_along_axis(vis_o, a_m[:, None], -1)[:, 0]
+                regret = jnp.where(
+                    regret_valid, q_o_oracle_action - q_o_model_action, 0.0
+                )
+
+                # one-step reward prediction for the taken action on the real embedding
+                reward_pred, _ = dynamics_fn(root_embedding, a_m)
+
+                nstate = eval_env.step(state, a_m)
+                goal, _ = split_termination_truncation(
+                    1.0 - nstate.done, nstate.info["truncation"]
+                )
+                out = {
+                    "active": active,
+                    "obs": state.obs,
+                    "action": a_m,
+                    "done": nstate.done,
+                    "agree": (a_m == a_o).astype(jnp.float32),
+                    "regret": regret,
+                    "regret_valid": regret_valid.astype(jnp.float32),
+                    "q_abs_err": q_abs_err,
+                    "q_bias": q_bias,
+                    "value_diff": v_m - v_o,
+                    "goal": goal,
+                    "pred_goal": (reward_pred > -0.5).astype(jnp.float32),
+                    "reward_pred": reward_pred,
+                    "tree_depth_max": depth_max.astype(jnp.float32),
+                    "tree_depth_mean": depth_mean,
+                    "tree_frac_beyond_unroll": depth_frac_beyond,
+                }
+                next_active = active * (1.0 - nstate.done)
+                return (nstate, next_active), out
+
+            _, traj = jax.lax.scan(
+                step,
+                (state0, jnp.ones(num_envs)),
+                jax.random.split(unroll_key, episode_length),
+            )
+
+            act = traj["active"]  # [T, B]
+
+            def masked_mean(x, m):
+                return jnp.sum(x * m) / jnp.maximum(jnp.sum(m), 1.0)
+
+            goal = traj["goal"] * act
+            pred = traj["pred_goal"] * act
+            tp = jnp.sum(goal * pred)
+            metrics = {
+                "diag/action_agreement": masked_mean(traj["agree"], act),
+                "diag/oracle_regret": masked_mean(
+                    traj["regret"], act * traj["regret_valid"]
+                ),
+                "diag/root_q_abs_err": masked_mean(traj["q_abs_err"], act),
+                "diag/root_q_bias": masked_mean(traj["q_bias"], act),
+                "diag/root_value_diff": masked_mean(traj["value_diff"], act),
+                "diag/goal_recall": tp / jnp.maximum(jnp.sum(goal), 1.0),
+                "diag/goal_precision": tp / jnp.maximum(jnp.sum(pred), 1.0),
+                "diag/num_goals": jnp.sum(goal),
+                "diag/reward_pred_goal": masked_mean(traj["reward_pred"], goal),
+                "diag/reward_pred_other": masked_mean(
+                    traj["reward_pred"], act * (1.0 - traj["goal"])
+                ),
+                # learned-model search tree depth (dynamics steps from the root)
+                "diag/tree_depth_max": masked_mean(traj["tree_depth_max"], act),
+                "diag/tree_depth_mean": masked_mean(traj["tree_depth_mean"], act),
+                "diag/tree_frac_beyond_unroll": masked_mean(
+                    traj["tree_frac_beyond_unroll"], act
+                ),
+            }
+
+            # value drift along the real trajectory
+            T = traj["obs"].shape[0]
+            obs_flat = jnp.reshape(traj["obs"], (T * num_envs,) + traj["obs"].shape[2:])
+            h_real = representation_fn(obs_flat)  # [T*B, E]
+            # quantile mean (identical to [..., 0] for 1 atom)
+            v_real = jnp.reshape(jnp.mean(forward(h_real)[1], axis=-1), (T, num_envs))
+            h = h_real
+            not_done_so_far = act  # valid start: active, no episode end in between
+            for k in range(1, max_drift_steps + 1):
+                a_prev = jnp.concatenate(
+                    [traj["action"][k - 1 :], jnp.zeros((k - 1, num_envs), jnp.int32)]
+                )
+                done_prev = jnp.concatenate(
+                    [traj["done"][k - 1 :], jnp.ones((k - 1, num_envs))]
+                )
+                _, h = dynamics_fn(h, jnp.reshape(a_prev, (T * num_envs,)))
+                not_done_so_far = not_done_so_far * (1.0 - done_prev)
+                v_pred = jnp.reshape(jnp.mean(forward(h)[1], axis=-1), (T, num_envs))
+                v_target = jnp.concatenate([v_real[k:], jnp.zeros((k, num_envs))])
+                valid = not_done_so_far * jnp.concatenate(
+                    [jnp.ones((T - k, num_envs)), jnp.zeros((k, num_envs))]
+                )
+                metrics[f"diag/value_drift_k{k}"] = masked_mean(
+                    jnp.abs(v_pred - v_target), valid
+                )
+            return metrics
+
+        self._run = jax.jit(run)
+
+    def run(self, policy_params: Any) -> Metrics:
+        self._key, key = jax.random.split(self._key)
+        t = time.time()
+        metrics = {k: float(v) for k, v in self._run(policy_params, key).items()}
+        metrics["diag/time"] = np.round(time.time() - t)
+        return metrics
+
+
 
 
 def reanalyze(
@@ -771,10 +1105,38 @@ def reanalyze(
     return data
 
 
+# Categorical supports: configurable range and resolution of the categorical
+# value / reward support in h-space (MuZero: 601 integer atoms, i.e. range
+# +-300 with step 1, sized for Atari). num_atoms = 2 * round(max / step) + 1,
+# atoms at i * step for i = -M..M. support_max=None -> integer support (step 1).
+def num_support_atoms(support_max: float | None, support_step: float) -> int:
+    if support_max is None:  # MuZero / Atari support: 601 integer atoms
+        return 601
+    return 2 * round(support_max / support_step) + 1
+
+
+def value_support() -> tuple[int, float | None]:
+    """(num_atoms, support_max) of the categorical value head."""
+    return (
+        num_support_atoms(Config.value_support_max, Config.value_support_step),
+        Config.value_support_max,
+    )
+
+
+def reward_support() -> tuple[int, float | None]:
+    """(num_atoms, support_max) of the categorical reward head."""
+    return (
+        num_support_atoms(Config.reward_support_max, Config.reward_support_step),
+        Config.reward_support_max,
+    )
+
+
 def invertible_scalar_transformation(
     x: jnp.ndarray,
     num_atoms: int,
+    support_max: float | None = None,
 ) -> jnp.ndarray:
+    """Two-hot encoding of h(x) on the support (MuZero Appendix F)."""
     epsilon = 0.001
     sign = jnp.sign(x)
     x = sign * (jnp.sqrt(jnp.abs(x) + 1) - 1) + epsilon * x
@@ -782,11 +1144,14 @@ def invertible_scalar_transformation(
     # remove the trailing singleton if present
     x = jnp.squeeze(x)  # now shape [...]
     M = num_atoms // 2
-    centers = jnp.arange(-M, M + 1, dtype=x.dtype)  # shape (S,)
+    # atom spacing (1.0 for the integer support)
+    step = 1.0 if support_max is None else support_max / M
+    centers = jnp.arange(-M, M + 1, dtype=x.dtype) * step  # shape (S,)
     # clip outliers in original array
-    x = jnp.clip(x, -M, M)
-    # compute 1 - |x - i|; this is positive only for |x - i| < 1, i.e. only at floor(x) and ceil(x)
-    w = 1.0 - jnp.abs(x[..., None] - centers)  # shape [..., S]
+    x = jnp.clip(x, -M * step, M * step)
+    # compute 1 - |x - c| / step; this is positive only for the two neighbouring
+    # atoms of x (two-hot encoding in h-space)
+    w = 1.0 - jnp.abs(x[..., None] - centers) / step  # shape [..., S]
     # clip negatives to zero
     return jnp.clip(w, 0.0)
 
@@ -838,21 +1203,80 @@ def scalar_untransform(y: jnp.ndarray, eps: float = 1e-3) -> jnp.ndarray:
     )
 
 
-def logits_to_scalar_expectation(logits: jnp.ndarray, eps: float = 1e-3) -> jnp.ndarray:
-    # NOTE: this decoding (E[φ^{-1}(i)]) does not match the two-hot encoding;
-    # the paper-consistent φ^{-1}(E[i]) is in muzero_ablate.py. Not ported here:
-    # on seed 20 it made full MuZero collapse early (eval -500 up to ~60k steps,
-    # policy loss ~0.3), while this version learns.
-    # Convert 601-way logits to scalar by E[φ^{-1}(i)]
+def logits_to_scalar_expectation(
+    logits: jnp.ndarray,
+    eps: float = 1e-3,
+    support_max: float | None = None,
+) -> jnp.ndarray:
+    # Decoding matches the encoding (MuZero paper, Appendix F):
+    # "the actual value and rewards are obtained by first computing their
+    # expected value under their respective softmax distribution and
+    # subsequently by inverting the scaling transformation", i.e.
+    #     value = φ^{-1}( E_p[i] )      (expectation in φ-space)
+    # This exactly inverts the two-hot encoding in
+    # invertible_scalar_transformation (two-hot on φ(x) => E_p[i] = φ(x)).
+    # (E_p[φ^{-1}(i)] would be biased between atoms and extremely sensitive to
+    # tail mass on far atoms, φ^{-1}(300) ≈ 5.9e4.)
     probs = jax.nn.softmax(logits, axis=-1)
     n = logits.shape[-1]
     k = (n - 1) // 2
-    support = jnp.arange(-k, k + 1, dtype=logits.dtype)  # in φ-space
-    support_untransformed = scalar_untransform(
-        support, eps=eps
-    )  # φ^{-1}(i) for every i
-    value = jnp.sum(probs * support_untransformed, axis=-1, keepdims=True)
+    # atom spacing (1.0 for the integer support)
+    step = 1.0 if support_max is None else support_max / k
+    support = jnp.arange(-k, k + 1, dtype=logits.dtype) * step  # in φ-space
+    transformed_value = jnp.sum(probs * support, axis=-1, keepdims=True)  # E_p[i]
+    value = scalar_untransform(transformed_value, eps=eps)  # φ^{-1}(E_p[i])
     return value
+
+
+# Raw-space two-hot (Config.value_raw_space_twohot, DreamerV3-style): atoms
+# are spaced evenly in h-space (same support as above) but the two-hot
+# interpolation and the decoding happen in RAW space:
+#   atoms a_i = h^-1(i * step),  target -> two-hot between neighbouring a_i
+#   linear in raw value,  decoded value = sum_i p_i a_i.
+# The mean of a mixture of two-hots is then the mean of the targets
+# (unbiased under noisy targets), whereas MuZero's h-space version estimates
+# h^-1(E[h(G)]) (Jensen bias towards smaller |V| for noisy targets).
+def raw_space_atoms(num_atoms: int, support_max: float | None) -> jnp.ndarray:
+    M = num_atoms // 2
+    step = 1.0 if support_max is None else support_max / M
+    return scalar_untransform(jnp.arange(-M, M + 1, dtype=jnp.float32) * step)
+
+
+def raw_space_twohot(
+    x: jnp.ndarray, num_atoms: int, support_max: float | None
+) -> jnp.ndarray:
+    atoms = raw_space_atoms(num_atoms, support_max)  # increasing, [S]
+    x = jnp.clip(jnp.squeeze(x), atoms[0], atoms[-1])
+    right_gap = jnp.concatenate([atoms[1:] - atoms[:-1], jnp.array([jnp.inf])])
+    left_gap = jnp.concatenate([jnp.array([jnp.inf]), atoms[1:] - atoms[:-1]])
+    d = x[..., None] - atoms  # [..., S]
+    w = jnp.where(d >= 0, 1.0 - d / right_gap, 1.0 + d / left_gap)
+    return jnp.clip(w, 0.0, 1.0)
+
+
+def raw_space_expectation(
+    logits: jnp.ndarray, support_max: float | None
+) -> jnp.ndarray:
+    atoms = raw_space_atoms(logits.shape[-1], support_max)
+    probs = jax.nn.softmax(logits, axis=-1)
+    return jnp.sum(probs * atoms, axis=-1, keepdims=True)
+
+
+def decode_value_logits(logits: jnp.ndarray) -> jnp.ndarray:
+    """Decoded scalar value of the categorical value head (per Config)."""
+    if Config.value_raw_space_twohot:
+        return raw_space_expectation(logits, value_support()[1])
+    return logits_to_scalar_expectation(logits, support_max=value_support()[1])
+
+
+def encode_value_targets(x: jnp.ndarray) -> jnp.ndarray:
+    """Two-hot targets of the categorical value head (per Config)."""
+    n_atoms, support_max = value_support()
+    if Config.value_raw_space_twohot:
+        return raw_space_twohot(x, n_atoms, support_max)
+    return invertible_scalar_transformation(x, n_atoms, support_max=support_max)
+
+
 
 
 def n_step_bootstrapped_targets(
@@ -863,7 +1287,7 @@ def n_step_bootstrapped_targets(
     values: jnp.ndarray,
     n: int = 5,
     gamma: float = 1.0,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Computes n-step bootstrapped return targets over a sequence.
 
     Args:
@@ -897,21 +1321,9 @@ def n_step_bootstrapped_targets(
 
     # Pad sequences. Shape is now (T + n - 1, ...).
     rewards = jnp.concatenate([rewards, jnp.zeros((n - 1,) + batch_shape[1:])])
-    # ######################################################################
-    # ### FIX (PORTED FROM muzero_ablate): padded steps past the end of the
-    # ### sequence must have discount 1 (no time passes there), not gamma.
-    # ### Previously the last n-1 steps of every unroll bootstrapped V(s_T)
-    # ### with gamma^n instead of gamma^(T-t). Active since use_gae=False.
-    # ### Old:
-    # # discounts = (
-    # #     jnp.concatenate([discounts, jnp.ones((n - 1,) + batch_shape[1:])]) * gamma
-    # # )
-    # # ...
-    # # bootstrap_discounts = (
-    # #     jnp.concatenate([termination_discount, jnp.ones((n - 1,) + batch_shape[1:])])
-    # #     * gamma
-    # # )
-    # ######################################################################
+    # Padded steps past the end of the sequence have discount 1 (no time
+    # passes there), not gamma, so the last n-1 steps of every unroll
+    # bootstrap V(s_T) with gamma^(T-t).
     discounts = jnp.concatenate(
         [discounts * gamma, jnp.ones((n - 1,) + batch_shape[1:])]
     )
@@ -920,7 +1332,6 @@ def n_step_bootstrapped_targets(
     bootstrap_discounts = jnp.concatenate(
         [termination_discount * gamma, jnp.ones((n - 1,) + batch_shape[1:])]
     )
-    # ### END FIX ############################################################
     bootstrap_discounts = jax.lax.dynamic_slice_in_dim(
         bootstrap_discounts, n - 1, seq_len
     )
@@ -954,7 +1365,7 @@ def compute_gae(
     values: jnp.ndarray,
     lambda_: float = 1.0,
     discount: float = 0.99,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Calculates the Generalized Advantage Estimation (GAE).
 
     Args:
@@ -1018,8 +1429,44 @@ def compute_gae(
     )
 
 
+# The env wrapper sets done = 1 both on real termination and on truncation
+# (time limit), and transitions store discount = 1 - done. Truncation must not
+# be treated like termination (absorbing, no bootstrap), so the two are split.
+def split_termination_truncation(
+    discount: jnp.ndarray, truncation: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Returns (termination, truncation) flags from discount = 1 - done.
+
+    termination: episode really ended (absorbing state, value 0 afterwards).
+    truncation: episode was cut by the time limit (bootstrap, no absorbing state).
+    """
+    done = 1.0 - discount
+    truncation = done * truncation  # truncation flag only counts on done steps
+    termination = done * (1.0 - truncation)
+    return termination, truncation
+
+
+# Reward-aware PER: one-step reward prediction error of the learned model
+# for stored transitions, |r_hat(repr(o_t), a_t) - r_t| (the quantity the
+# reward loss trains at k=0). Used in the replay priorities so that rare goal
+# transitions (reward 0 vs. -1 everywhere else) are sampled more often.
+def reward_prediction_error(
+    representation_fn: Callable,
+    dynamics_fn: Callable,
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,
+    rewards: jnp.ndarray,
+) -> jnp.ndarray:
+    batch_shape = rewards.shape
+    obs = jnp.reshape(observations, (-1,) + observations.shape[len(batch_shape) :])
+    reward_pred, _ = dynamics_fn(
+        representation_fn(obs), jnp.reshape(actions, (-1,)).astype(jnp.int32)
+    )
+    return jnp.reshape(jnp.abs(reward_pred - jnp.reshape(rewards, (-1,))), batch_shape)
+
+
 def collect_targets(
-    targets: Tuple[
+    targets: tuple[
         jnp.ndarray,
         jnp.ndarray,
         jnp.ndarray,
@@ -1031,7 +1478,8 @@ def collect_targets(
     ],
     done: jnp.ndarray,
     unroll_steps: int = 5,
-) -> Tuple[
+    truncation: jnp.ndarray | None = None,
+) -> tuple[
     jnp.ndarray,
     jnp.ndarray,
     jnp.ndarray,
@@ -1066,7 +1514,7 @@ def collect_targets(
         Returns:
             jnp.ndarray: New array of shape [T, B, U, ...].
         """
-        T, B = array.shape[:2]  # Extract time and batch dimensions
+        T = array.shape[0]  # time dimension
 
         # Create time indices dynamically inside JIT
         t_indices = jnp.arange(T)[:, None] + jnp.arange(unroll_steps)  # Shape [T, U]
@@ -1081,8 +1529,6 @@ def collect_targets(
         )
 
         return expanded_array
-
-    #################### old ########################
 
     T, B = done.shape[:2]  # Extract time and batch dimensions
 
@@ -1104,17 +1550,25 @@ def collect_targets(
     # Expand mask to match full shape [T, B, U, ...]
     mask = jnp.broadcast_to(mask, (T, B, unroll_steps) + done.shape[2:])
 
-    # --- Apply `done` masking ---
-    # Expand `done` for broadcasting: [T, B, U]
-    # done_expanded = jnp.broadcast_to(done[:, :, None], (T, B, unroll_steps))
+    # Unroll steps after a truncation inside the window belong to the next
+    # episode (auto-reset) and have no valid target -> mask them out of all
+    # losses (instead of treating them as an absorbing state).
+    # `done` passed in here is the real termination only.
+    if truncation is not None:
+        truncation = truncation[..., 0] if truncation.ndim == 3 else truncation
+        is_trunc_in_window = create_time_sliced_array(truncation)  # [T, B, U]
+        not_trunc_before = jnp.cumprod(
+            jnp.concatenate(
+                [
+                    jnp.ones_like(is_trunc_in_window[:, :, :1]),
+                    1.0 - is_trunc_in_window[:, :, :-1],
+                ],
+                axis=2,
+            ),
+            axis=2,
+        )
+        mask = mask * not_trunc_before
 
-    # # Create a cumulative "done" mask to zero out future steps
-    # cumulative_done = jnp.cumsum(done_expanded, axis=2) > 1  # True after first `1` in done
-
-    # # Convert boolean mask to float and apply it
-    # mask = mask * (~cumulative_done).astype(jnp.float32)
-
-    #################### old ########################
 
     is_terminal_flag_in_unroll_window = create_time_sliced_array(done)  # [T,B,U]
     is_not_terminal_flag_in_unroll_window = 1.0 - is_terminal_flag_in_unroll_window
@@ -1141,15 +1595,10 @@ def collect_targets(
     # post terminal states
     reward = reward * propagated_not_terminal_mask
 
-    # TODO 1201 antigravity ------------------------------------
     value_prefix_target = value_prefix_target * propagated_not_terminal_mask
     bootstrap_discount = bootstrap_discount * propagated_not_terminal_mask
-    # ----------------------------------------------------------
 
-    ####################################################################################
-    # TODO: temporary insertion to keep observations constant after terminal observation
-
-    # --- Correct post-process: repeat terminal observation per-trajectory (per T,B) only ---
+    # absorbing states: repeat the terminal observation per trajectory (per T, B)
 
     # `is_terminal_flag_in_unroll_window` : [T, B, U] (0/1 floats)
     # `unroll_obs` : [T, B, U, obs_dim]
@@ -1177,7 +1626,6 @@ def collect_targets(
 
     # Replace observations at-and-after the terminal with the terminal observation (per T,B)
     unroll_obs = jnp.where(any_after_first[..., None], terminal_obs_bcast, unroll_obs)
-    ####################################################################################
 
     return (
         unroll_obs,
@@ -1250,18 +1698,18 @@ def mse_value_loss(values: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
 
 
 def compute_muzero_loss(
-    params: Union[AZNetworkParams, AtariAZNetworkParams],
+    params: AZNetworkParams | AtariAZNetworkParams,
     normalizer_params: Any,
     data: MuZeroTransition,
     rng: jnp.ndarray,
-    az_network: Union[AZNetworks, AtariAZNetworks],
+    az_network: AZNetworks | AtariAZNetworks,
     value_loss_fn: Callable[[Any], jnp.ndarray],
     num_unroll_steps: int = 5,
     vf_cost: float = 0.5,
     l2_coef: float = 1e-4,
     shared_feature_extractor: bool = False,
     per_importance_sampling: bool = True,
-) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
+) -> tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
     """Computes Alphazero loss .
 
     Args:
@@ -1279,17 +1727,11 @@ def compute_muzero_loss(
     Returns:
         A tuple (loss, metrics)
     """
-    parametric_action_distribution = az_network.parametric_action_distribution
-
     policy_apply = az_network.policy_network.apply
     value_apply = az_network.value_network.apply
     representation_apply = az_network.representation_network.apply
     dynamics_apply = az_network.dynamics_network.apply
 
-    # Put the time dimension first.
-    # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
-
-    #############################################
     def reanalyze_policy(hidden_state):
         prior_logits = policy_apply(jnp.zeros(1), params.policy, hidden_state)
         value = value_apply(jnp.zeros(1), params.value, hidden_state)
@@ -1390,7 +1832,6 @@ def compute_muzero_loss(
 
         return policy_output.search_tree.summary().value
 
-    #############################################
 
     hidden = data.observation
     if shared_feature_extractor:
@@ -1401,26 +1842,51 @@ def compute_muzero_loss(
 
     hidden = representation_apply(normalizer_params, params.representation, hidden)
 
+    # Collapse diagnostics: is the representation input-dependent? Metrics
+    # only (stop_gradient), computed on the root embeddings of this batch.
+    #   repr_pairwise_cosine  mean cosine between embeddings of DIFFERENT
+    #                         states; -> 1 when all embeddings are the same
+    #   repr_feature_std      per-feature std across the batch, averaged over
+    #                         features; -> 0 when collapsed
+    #   repr_layernorm_gain   mean |LayerNorm scale| of the representation
+    #                         network (L2 can pull it to 0 -> constant output)
+    h_sg = jax.lax.stop_gradient(hidden)
+    h_unit = h_sg / jnp.maximum(jnp.linalg.norm(h_sg, axis=-1, keepdims=True), 1e-8)
+    n_batch = h_unit.shape[0]
+    cos_matrix = h_unit @ h_unit.T
+    repr_pairwise_cosine = (jnp.sum(cos_matrix) - jnp.trace(cos_matrix)) / (
+        n_batch * (n_batch - 1)
+    )
+    repr_feature_std = jnp.mean(jnp.std(h_sg, axis=0))
+    layernorm_scales = [
+        jnp.abs(leaf).ravel()
+        for path, leaf in jax.tree_util.tree_flatten_with_path(params.representation)[0]
+        if "LayerNorm" in jax.tree_util.keystr(path)
+        and "scale" in jax.tree_util.keystr(path)
+    ]
+    repr_layernorm_gain = (
+        jnp.mean(jax.lax.stop_gradient(jnp.concatenate(layernorm_scales)))
+        if layernorm_scales
+        else jnp.array(jnp.nan)
+    )
+
     # scan loss over K unroll steps of dynamics model
-    # ######################################################################
-    # ### PORTED FROM muzero_ablate (BOTTOM-UP STEP 2b): MuZero gradient scaling
-    # ### (Config.dynamics_gradient_scale). MuZero pseudocode (update_weights):
-    # ###   for action in actions:
-    # ###       ..., hidden_state = network.recurrent_inference(hidden_state, action)
-    # ###       hidden_state = scale_gradient(hidden_state, 0.5)
-    # ### i.e. the representation output (k=0) enters the first dynamics call
-    # ### unscaled; every later recurrent hidden state is scaled before it enters
-    # ### the next dynamics call. The heads always see the unscaled hidden state.
-    # ### Forward values are unchanged, only gradients are scaled.
-    # ######################################################################
+    # MuZero gradient scaling (Config.dynamics_gradient_scale), MuZero pseudocode (train_network / update_weights):
+    #   for action in actions:
+    #       ..., hidden_state = network.recurrent_inference(hidden_state, action)
+    #       hidden_state = scale_gradient(hidden_state, 0.5)
+    # i.e. the representation output (k=0) enters the first dynamics call
+    # unscaled; every later recurrent hidden state is scaled before it enters
+    # the next dynamics call. The heads always see the unscaled hidden state.
+    # Forward values are unchanged, only gradients are scaled.
     def scale_gradient(x: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
         return x * scale + jax.lax.stop_gradient(x) * (1.0 - scale)
 
     def unroll_loss(
-        carry: Tuple[jnp.ndarray, jnp.ndarray],
+        carry: tuple[jnp.ndarray, jnp.ndarray],
         targets_actions_mask: Any,
-    ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], Any]:
-        # ### PORTED (STEP 2b): carry = (hidden state, gradient scale for dynamics input)
+    ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], Any]:
+        # carry = (hidden state, gradient scale for the dynamics input)
         hidden_states, dynamics_input_grad_scale = carry
         (
             observations,
@@ -1430,7 +1896,7 @@ def compute_muzero_loss(
             actions,
             term_mask,
         ) = targets_actions_mask
-        value_prefix_target, bootstrap_discount, bootstrap_value, bootstrap_obs = (
+        value_prefix_target, bootstrap_discount, bootstrap_value, _bootstrap_obs = (
             value_targets
         )
 
@@ -1443,7 +1909,6 @@ def compute_muzero_loss(
         model_reward, n_hidden_state = dynamics_apply(
             jnp.zeros(1),
             params.dynamics,
-            # ### PORTED (STEP 2b), was: hidden_states
             scale_gradient(hidden_states, dynamics_input_grad_scale),
             actions,
         )
@@ -1458,19 +1923,11 @@ def compute_muzero_loss(
 
         # Value function loss
         # TODO NEW reanalyzed value target
-        bootstrap_hidden = representation_apply(
-            normalizer_params, params.representation, bootstrap_obs
-        )
-        # bootstrap_value = reanalyze_value(bootstrap_hidden)
-        bootstrap_value = value_apply(jnp.zeros(1), params.value, bootstrap_hidden)
-        # bootstrap_value = inverse_scalar_transform(bootstrap_value) # logits_to_scalar_expectation
-        bootstrap_value = logits_to_scalar_expectation(
-            bootstrap_value
-        )  # logits_to_scalar_expectation
-
-        # chex.assert_shape(value_prefix_target, (Config.replay_buffer_batch_size, 601))
-        # chex.assert_shape(bootstrap_discount, (Config.replay_buffer_batch_size, 601))
-        # chex.assert_shape(bootstrap_value, (Config.replay_buffer_batch_size, Config.num_atoms))
+        # Value targets are the stored targets computed in training_step from
+        # the MCTS search values (GAE(lambda) returns when use_gae=True, as in
+        # alphazero.py). NOTE: recomputing the bootstrap value from the online
+        # value network at loss time (no target network, no search improvement)
+        # made training oscillate and collapse.
         vs = (
             jnp.expand_dims(value_prefix_target, -1)
             + jnp.expand_dims(bootstrap_discount, -1) * bootstrap_value
@@ -1479,44 +1936,70 @@ def compute_muzero_loss(
         chex.assert_shape(term_mask, (Config.replay_buffer_batch_size,))
         vs = vs * term_mask.reshape((term_mask.shape[0],) + (1,) * (vs.ndim - 1))
         chex.assert_shape(vs, (Config.replay_buffer_batch_size, Config.num_atoms))
-        # v_losses = value_loss_fn(baseline, jax.lax.stop_gradient(vs))
 
-        # VALUE TEST
-        vs = invertible_scalar_transformation(vs, 601)
-        chex.assert_shape(vs, (Config.replay_buffer_batch_size, 601))
-        chex.assert_shape(baseline, (Config.replay_buffer_batch_size, 601))
-        v_losses = -jnp.sum(
-            jax.lax.stop_gradient(vs) * (jax.nn.log_softmax(baseline)), axis=-1
+        # value bias diagnostic (metrics only): decoded value prediction minus
+        # its (scalar) value target, per sample. Scalar MSE head -> ~0 on
+        # average; MuZero's h-space categorical head is expected to be biased
+        # towards smaller |V| for noisy targets (Jensen).
+        value_pred_scalar = (
+            decode_value_logits(baseline) if Config.categorical_value else baseline
+        )
+        # compare quantile means (identical for 1 atom)
+        value_error = jax.lax.stop_gradient(
+            jnp.mean(value_pred_scalar, axis=-1) - jnp.mean(vs, axis=-1)
         )
 
-        if per_importance_sampling:
-            v_losses *= data.weight
+        # value head (see Config): categorical cross-entropy, quantile Huber
+        # loss or MSE
+        if Config.categorical_value:
+            n_value_atoms, _ = value_support()
+            # two-hot in h-space (MuZero) or raw space (DreamerV3)
+            vs = encode_value_targets(vs)
+            chex.assert_shape(vs, (Config.replay_buffer_batch_size, n_value_atoms))
+            chex.assert_shape(
+                baseline, (Config.replay_buffer_batch_size, n_value_atoms)
+            )
+            v_losses = -jnp.sum(
+                jax.lax.stop_gradient(vs) * (jax.nn.log_softmax(baseline)), axis=-1
+            )
+        elif Config.num_atoms > 1:
+            # quantile regression (Config.num_atoms > 1): value head outputs num_atoms quantiles of the return; targets
+            # are the per-quantile GAE returns over the stored (quantile)
+            # search values; quantile Huber loss (Dabney et al. 2017, as in
+            # alphazero.py / AlphaTensor). The search uses the quantile mean
+            # (mctx_dist qtransforms average over the atom axis).
+            chex.assert_shape(
+                baseline, (Config.replay_buffer_batch_size, Config.num_atoms)
+            )
+            v_losses = quantile_regression_loss(
+                baseline,
+                jax.lax.stop_gradient(vs),
+                kappa=Config.qr_kappa,
+                num_atoms=Config.num_atoms,
+            )
+        else:
+            chex.assert_shape(baseline, (Config.replay_buffer_batch_size, 1))
+            v_losses = mse_value_loss(baseline, jax.lax.stop_gradient(vs))
+
+        # (PER importance weights are applied to all losses after the unroll)
         v_loss = vf_cost * v_losses
         chex.assert_shape(v_loss, (Config.replay_buffer_batch_size,))
 
         # dynamics (reward) function loss
-        # TODO get reward atoms as input
+        n_reward_atoms, reward_support_max = reward_support()
         reward_targets = invertible_scalar_transformation(
-            reward_targets, 601
-        )  # distributional value loss, see MuZero paper
+            reward_targets, n_reward_atoms, support_max=reward_support_max
+        )  # categorical reward loss, see MuZero paper
         dynamics_loss = -jnp.sum(
             jax.lax.stop_gradient(reward_targets) * (jax.nn.log_softmax(model_reward)),
             axis=-1,
         )
-        # old:
-        # model_reward = jnp.squeeze(model_reward, axis=-1)
-        # dynamics_loss = mse_value_loss(model_reward, jax.lax.stop_gradient(reward_targets))
-
         # consistency loss
         consistency_loss = -optax.cosine_similarity(
             hidden_states, jax.lax.stop_gradient(target_hidden)
         )
 
-        # loss *= loss_mask # mask out loss on steps beyond actual trajectory (no real target exists)
-        # policy_loss *= loss_mask
-        # v_loss *= loss_mask
-        # dynamics_loss *= loss_mask
-        # ### PORTED (STEP 2b): all later dynamics inputs get the configured scale
+        # all later dynamics inputs get the configured gradient scale
         next_grad_scale = jnp.full_like(
             dynamics_input_grad_scale, Config.dynamics_gradient_scale
         )
@@ -1525,6 +2008,7 @@ def compute_muzero_loss(
             v_loss,
             dynamics_loss,
             consistency_loss,
+            value_error,
         )
 
     chex.assert_shape(
@@ -1548,69 +2032,29 @@ def compute_muzero_loss(
     # swap batch and unroll axes
     targets = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), targets)
 
-    # jax.debug.print('targets: {x}', x=targets)
-
-    _, (policy_loss, v_loss, dynamics_loss, consistency_loss) = jax.lax.scan(
-        unroll_loss,
-        # ### PORTED (STEP 2b): first dynamics call (on representation output) unscaled
-        (hidden, jnp.ones((), dtype=hidden.dtype)),
-        targets,
-        length=num_unroll_steps,
-    )
-    # ### END PORTED (STEP 2b) ###################################################
-
-    # jax.debug.print('policy_loss: {x}', x=policy_loss.shape)
-    # jax.debug.print('v_loss: {x}', x=v_loss.shape)
-    # jax.debug.print('dynamics_loss: {x}', x=dynamics_loss.shape)
-    # jax.debug.print('consistency_loss: {x}', x=consistency_loss.shape)
-
-    # policy_logits = policy_apply(jnp.zeros(1), params.policy,
-    #                             hidden)
-
-    # baseline = value_apply(jnp.zeros(1), params.value, hidden)
-
-    # model_reward, n_hidden_state = dynamics_apply(jnp.zeros(1), params.dynamics, hidden, data.action)
-
-    # policy_targets = data.target_policy_probs
-
-    # target_action_log_probs = parametric_action_distribution.log_prob(
-    #     policy_logits, data.extras['policy_extras']['raw_action'])
-    # behaviour_action_log_probs = data.extras['policy_extras']['prior_log_prob']
-
-    # log_ratio = target_action_log_probs - behaviour_action_log_probs
-    # rho_s = jnp.exp(log_ratio)
-    # approx_kl = ((rho_s - 1) - log_ratio).mean()
-
-    # policy_loss = -jnp.mean(jnp.sum(jax.lax.stop_gradient(policy_targets)*(jax.nn.log_softmax(policy_logits)), axis=-1))
-
-    # # Value function loss
-    # vs = jnp.expand_dims(data.value_prefix_target, -1) + jnp.expand_dims(data.bootstrap_discount, -1) * data.bootstrap_value
-    # v_losses = value_loss_fn(baseline, jax.lax.stop_gradient(vs))
-    # if per_importance_sampling:
-    #     v_losses *= data.weight
-    # v_loss = vf_cost * jnp.mean(v_losses)
-
-    # # dynamics (reward) function loss
-    # dynamics_loss = jnp.mean(mse_value_loss(model_reward, data.reward))
-
-    # l2 penalty
-    l2_penalty = (
-        l2_coef
-        * 0.5
-        * sum(jnp.sum(jnp.square(w)) for w in jax.tree_util.tree_leaves(params))
+    _, (policy_loss, v_loss, dynamics_loss, consistency_loss, value_error) = (
+        jax.lax.scan(
+            unroll_loss,
+            # first dynamics call (on the representation output) is unscaled
+            (hidden, jnp.ones((), dtype=hidden.dtype)),
+            targets,
+            length=num_unroll_steps,
+        )
     )
 
-    # Entropy
-    # entropy = jnp.mean(parametric_action_distribution.entropy(policy_logits, rng))
+    # l2 penalty: only on weight matrices (flax "kernel" params), not on biases
+    # and LayerNorm scale/bias (standard AdamW practice). L2 on the LayerNorm
+    # gain pulls it towards 0, which makes the embedding input-independent ->
+    # representation collapse when the task signal is weak.
+    l2_leaves = [
+        w
+        for path, w in jax.tree_util.tree_flatten_with_path(params)[0]
+        if "'kernel'" in jax.tree_util.keystr(path)
+    ]
+    l2_penalty = l2_coef * 0.5 * sum(jnp.sum(jnp.square(w)) for w in l2_leaves)
 
-    # total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty
-    # test_mask = jnp.asarray([[1], [0], [0], [0], [0]])
-    unroll_mask = jnp.swapaxes(
-        data.unroll_mask, 0, 1
-    )  # * jnp.asarray([[0], [1], [1], [1], [1]])
-    terminal_mask = jnp.swapaxes(
-        data.terminal_mask, 0, 1
-    )  # * jnp.asarray([[0], [1], [1], [1], [1]])
+    unroll_mask = jnp.swapaxes(data.unroll_mask, 0, 1)
+    terminal_mask = jnp.swapaxes(data.terminal_mask, 0, 1)
     chex.assert_shape(
         unroll_mask, (Config.loss_unroll_length, Config.replay_buffer_batch_size)
     )
@@ -1628,23 +2072,14 @@ def compute_muzero_loss(
     )
     mask = unroll_mask * terminal_mask
 
-    # ######################################################################
-    # ### PORTED FROM muzero_ablate (BOTTOM-UP STEP 2c): MuZero per-step loss
-    # ### weights (Config.muzero_loss_weighting)
-    # ### MuZero pseudocode: prediction at k=0 (initial inference) has gradient
-    # ### scale 1, each of the K recurrent steps 1/K. Weights are normalised to
-    # ### sum to 1 (k=0: 0.5, each k>=1: 0.5/K) to keep the loss scale.
-    # ### Applied to policy and value losses. The reward (dynamics) loss stays
-    # ### uniform: here every reward prediction already comes from a recurrent
-    # ### step (dynamics_apply), i.e. all have weight 1/K in MuZero.
-    # ### With the flag off (or loss_unroll_length == 1) the weights are uniform,
-    # ### which reproduces the previous jnp.mean(..., where=mask) exactly.
-    # ### Old:
-    # # policy_loss = jnp.mean(policy_loss, where=mask)
-    # # v_loss = jnp.mean(v_loss, where=unroll_mask)
-    # ######################################################################
+    # MuZero per-step loss weights. MuZero pseudocode: prediction at k=0 (initial inference) has gradient
+    # scale 1, each of the K recurrent steps 1/K. Weights are normalised to
+    # sum to 1 (k=0: 0.5, each k>=1: 0.5/K) to keep the loss scale.
+    # Applied to policy and value losses. The reward (dynamics) loss stays
+    # uniform: here every reward prediction already comes from a recurrent
+    # step (dynamics_apply), i.e. all have weight 1/K in MuZero.
     num_steps = policy_loss.shape[0]
-    if Config.muzero_loss_weighting and num_steps > 1:
+    if num_steps > 1:
         step_weights = jnp.concatenate(
             [jnp.ones(1), jnp.full((num_steps - 1,), 1.0 / (num_steps - 1))]
         )
@@ -1654,9 +2089,7 @@ def compute_muzero_loss(
 
     def weighted_masked_mean(loss, loss_mask, weights):
         w = weights * loss_mask
-        return jnp.sum(jnp.where(w > 0, loss * w, 0.0)) / jnp.maximum(
-            jnp.sum(w), 1e-8
-        )
+        return jnp.sum(jnp.where(w > 0, loss * w, 0.0)) / jnp.maximum(jnp.sum(w), 1e-8)
 
     # per-k diagnostics (unweighted masked means), comparable across runs
     def masked_mean(loss, loss_mask):
@@ -1669,14 +2102,40 @@ def compute_muzero_loss(
         "policy_loss_k1plus": masked_mean(policy_loss[1:], mask[1:]),
         "value_loss_k0": masked_mean(v_loss[:1], unroll_mask[:1]),
         "value_loss_k1plus": masked_mean(v_loss[1:], unroll_mask[1:]),
+        # mean signed / absolute error of the decoded
+        # value vs its target (unweighted; batch is PER-sampled if alpha > 0)
+        "value_bias_k0": masked_mean(value_error[:1], unroll_mask[:1]),
+        "value_bias_k1plus": masked_mean(value_error[1:], unroll_mask[1:]),
+        "value_abs_err_k0": masked_mean(jnp.abs(value_error[:1]), unroll_mask[:1]),
     }
+
+    # PER: scale every per-sample loss term (policy, value, reward,
+    # consistency; all unroll steps) by the sample's importance-sampling
+    # weight, as MuZero / EfficientZero scale the whole loss. The per-k
+    # diagnostics above stay unweighted. With per_alpha = 0 all weights are 1.
+    if per_importance_sampling:
+        chex.assert_shape(data.weight, (Config.replay_buffer_batch_size,))
+        is_weight = data.weight[None, :]  # [1, B], broadcast over unroll steps
+        policy_loss = policy_loss * is_weight
+        v_loss = v_loss * is_weight
+        dynamics_loss = dynamics_loss * is_weight
+        consistency_loss = consistency_loss * is_weight
+
+    # consistency loss on recurrent steps only. At k=0 the
+    # predicted and target embedding are identical (-cos = -1, zero gradient),
+    # so including k=0 would only dilute the coefficient.
+    consistency_loss_k1plus = masked_mean(consistency_loss[1:], mask[1:])
 
     consistency_loss = jnp.mean(consistency_loss, where=mask)
     policy_loss = weighted_masked_mean(policy_loss, mask, step_weights)
     v_loss = weighted_masked_mean(v_loss, unroll_mask, step_weights)
     dynamics_loss = jnp.mean(dynamics_loss, where=unroll_mask)
-    # ### END PORTED (STEP 2c) ###############################################
-    total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty  # + consistency_loss
+    total_loss = policy_loss + v_loss + dynamics_loss + l2_penalty
+    # consistency loss (Config.consistency_loss_coef):
+    # -cos(predicted embedding at k, stop_grad(representation(real obs at k))),
+    # k >= 1, masked after terminals. Gradient flows into dynamics (and via
+    # the unroll into the representation), not into the target branch.
+    total_loss = total_loss + Config.consistency_loss_coef * consistency_loss_k1plus
 
     metrics = {
         "total_loss": total_loss,
@@ -1685,9 +2144,12 @@ def compute_muzero_loss(
         "dynamics_loss": dynamics_loss,
         "consistency_loss": consistency_loss,
         "l2_penalty": l2_penalty,
-        **unroll_diagnostics,  # ### PORTED (STEP 2c)
-        # 'entropy': entropy,
-        # 'approx_kl': jax.lax.stop_gradient(approx_kl),
+        **unroll_diagnostics,
+        "consistency_loss_k1plus": consistency_loss_k1plus,
+        # collapse diagnostics
+        "repr_pairwise_cosine": repr_pairwise_cosine,
+        "repr_feature_std": repr_feature_std,
+        "repr_layernorm_gain": repr_layernorm_gain,
     }
 
     return total_loss, metrics
@@ -1805,7 +2267,6 @@ def main(_):
     dummy_obs = jnp.zeros(
         observation_shape,
     )
-    dummy_action = jnp.zeros((action_size,))
     dummy_transition = (
         MuZeroTransition(  # pytype: disable=wrong-arg-types  # jax-ndarray
             observation=dummy_obs,
@@ -1821,8 +2282,16 @@ def main(_):
             bootstrap_value=jnp.zeros(Config.num_atoms),
             bootstrap_discount=0.0,
             extras={
-                "state_extras": {"truncation": 0.0},
-                "policy_extras": {"prior_log_prob": 0.0, "raw_action": 0.0},
+                # episode step counter (for episode-length diagnostics)
+                "state_extras": {"truncation": 0.0, "steps": 0.0},
+                "policy_extras": {
+                    "prior_log_prob": 0.0,
+                    "raw_action": 0.0,
+                    # search diagnostics
+                    "search_entropy": 0.0,
+                    "prior_entropy": 0.0,
+                    "root_q_spread": 0.0,
+                },
             },
             priority=0.0,
             weight=0.0,
@@ -1847,16 +2316,19 @@ def main(_):
     )
 
     if Config.per_alpha > -1:
-        replay_buffer = replay_buffers.PrioritizedSamplingQueue(  # UniformSamplingQueue Queue PrioritizedSamplingQueue
+        replay_buffer = replay_buffers.PrioritizedSamplingQueue(
             max_replay_size=max_replay_size // device_count,
             dummy_data_sample=dummy_transition,
             sample_batch_size=Config.replay_buffer_batch_size
             * Config.num_minibatches
             // device_count,
-            per_importance_sampling_beta=Config.per_importance_sampling_beta,
+            # beta = 1 in the buffer when annealing (the annealed beta is applied to the sampled weights in training_step)
+            per_importance_sampling_beta=(
+                1.0 if Config.per_beta_anneal else Config.per_importance_sampling_beta
+            ),
         )
     else:
-        replay_buffer = replay_buffers.UniformSamplingQueue(  # UniformSamplingQueue Queue PrioritizedSamplingQueue
+        replay_buffer = replay_buffers.UniformSamplingQueue(
             max_replay_size=max_replay_size // device_count,
             dummy_data_sample=dummy_transition,
             sample_batch_size=Config.replay_buffer_batch_size
@@ -1891,12 +2363,44 @@ def main(_):
     make_representation = make_representation_fn(az_network)
     make_dynamics = make_dynamics_fn(az_network)
 
+    # optax schedules count OPTIMIZER UPDATES, not env steps (a 1M-step run has
+    # only ~68k updates): epochs x training steps per epoch x update_epochs x
+    # minibatches.
+    total_optimizer_updates = int(
+        num_evals_after_init
+        * num_training_steps_per_epoch
+        * max(Config.num_resets_per_eval, 1)
+        * Config.update_epochs
+        * Config.num_minibatches
+    )
+    logging.info(f"lr schedule: {total_optimizer_updates} optimizer updates in total")
+
     # create optimizer
-    if Config.anneal_lr:
+    # late lr decay (Config.late_lr_decay): constant lr for the first
+    # lr_decay_start_frac of the optimizer updates, then linear decay to 1%
+    # over the rest. Takes precedence over anneal_lr.
+    if Config.late_lr_decay:
+        decay_start = int(Config.lr_decay_start_frac * total_optimizer_updates)
+        learning_rate = optax.join_schedules(
+            [
+                optax.constant_schedule(Config.learning_rate),
+                optax.linear_schedule(
+                    Config.learning_rate,
+                    Config.learning_rate * 0.01,
+                    transition_steps=max(total_optimizer_updates - decay_start, 1),
+                ),
+            ],
+            boundaries=[decay_start],
+        )
+        logging.info(
+            f"late lr decay: constant until update {decay_start}, then linear to "
+            f"{Config.learning_rate * 0.01} at update {total_optimizer_updates}"
+        )
+    elif Config.anneal_lr:
         learning_rate = optax.linear_schedule(
             Config.learning_rate,
-            Config.learning_rate * 0.01,  # 0
-            transition_steps=Config.total_timesteps,
+            Config.learning_rate * 0.01,
+            transition_steps=total_optimizer_updates,
         )
     else:
         learning_rate = Config.learning_rate
@@ -1924,14 +2428,8 @@ def main(_):
         raise ValueError("num_atoms must be a positive integer.")
 
     if Config.reanalyze:
-        raise NotImplementedError
-        if Config.use_gae:
-            raise ValueError(
-                "Reanalyze not compatible with Generalized Advantage Estimation"
-            )
-        # reanalyze_fn = reanalyze
-    else:
-        reanalyze_fn = lambda x, a, b, c: x
+        # TODO: reanalyze (see reanalyze()); not functional yet
+        raise NotImplementedError("reanalyze is not implemented yet")
 
     # create loss function via functools.partial
     loss_fn = partial(
@@ -1947,7 +2445,7 @@ def main(_):
 
     def loss_and_pgrad(
         loss_fn: Callable[..., float],
-        pmap_axis_name: Optional[str],
+        pmap_axis_name: str | None,
         has_aux: bool = False,
     ):
         g = jax.value_and_grad(loss_fn, has_aux=has_aux)
@@ -1961,7 +2459,7 @@ def main(_):
     def gradient_update_fn(
         loss_fn: Callable[..., float],
         optimizer: optax.GradientTransformation,
-        pmap_axis_name: Optional[str],
+        pmap_axis_name: str | None,
         has_aux: bool = False,
     ):
         """Wrapper of the loss function that apply gradient updates.
@@ -1984,6 +2482,25 @@ def main(_):
 
         def f(*args, optimizer_state):
             value, grads = loss_and_pgrad_fn(*args)
+            # gradient norm diagnostics: norms BEFORE clipping (metrics
+            # only). grad_clip_frac = fraction of updates where the global
+            # norm exceeds max_grad_norm, i.e. clip_by_global_norm rescales
+            # the gradients of ALL networks by max_grad_norm / grad_norm.
+            if has_aux:
+                loss, metrics = value
+                grad_norm = optax.global_norm(grads)
+                metrics = {
+                    **metrics,
+                    "grad_norm": grad_norm,
+                    "grad_clip_frac": (grad_norm > Config.max_grad_norm).astype(
+                        jnp.float32
+                    ),
+                    "grad_norm_policy": optax.global_norm(grads.policy),
+                    "grad_norm_value": optax.global_norm(grads.value),
+                    "grad_norm_representation": optax.global_norm(grads.representation),
+                    "grad_norm_dynamics": optax.global_norm(grads.dynamics),
+                }
+                value = (loss, metrics)
             params_update, optimizer_state = optimizer.update(grads, optimizer_state)
             params = optax.apply_updates(args[0], params_update)
             return value, params, optimizer_state
@@ -2034,55 +2551,40 @@ def main(_):
         )
         return (optimizer_state, params, key), metrics
 
-    def training_step(
-        carry: Tuple[TrainingState, State, ReplayBufferState, jnp.ndarray], unused_t
-    ) -> Tuple[Tuple[TrainingState, State, ReplayBufferState, jnp.ndarray], Metrics]:
-        training_state, state, buffer_state, key = carry
-        key_sgd, key_generate_unroll, key_bootstrap, reanalyze_key, new_key = (
-            jax.random.split(key, 5)
-        )
-
-        forward_fn = make_forward(
-            (
-                jnp.zeros(1),
-                training_state.params.policy,
-                training_state.params.value,
-                training_state.params.feature_extractor,
+    def replay_priorities(
+        targets: jnp.ndarray,
+        predicted_values: jnp.ndarray,
+        data: MuZeroTransition,
+        representation_fn: BaseRepresentationFn,
+        dynamics_fn: BaseDynamicsFn,
+    ) -> jnp.ndarray:
+        """(|value error| + w * |one-step reward error| + eps) ** alpha (reward-aware PER)."""
+        return (
+            jnp.mean(jnp.abs(targets - predicted_values), axis=-1)
+            + Config.per_reward_priority_weight
+            * reward_prediction_error(
+                representation_fn,
+                dynamics_fn,
+                data.observation,
+                data.action,
+                data.reward,
             )
-        )
+            + Config.per_epsilon
+        ) ** Config.per_alpha
 
-        representation_fn = make_representation(
-            (training_state.normalizer_params, training_state.params.representation)
+    def process_unroll(
+        data: MuZeroTransition,
+        transition: MuZeroTransition,
+        representation_fn: BaseRepresentationFn,
+        dynamics_fn: BaseDynamicsFn,
+    ) -> tuple[MuZeroTransition, jnp.ndarray, jnp.ndarray]:
+        """Value targets, replay priorities and unroll targets for a fresh unroll
+        [T, B, ...]; `transition` is the extra search at the final state (bootstrap).
+        Returns (data, termination, truncation)."""
+        # split done into real termination and truncation (time limit)
+        termination, truncation = split_termination_truncation(
+            data.discount, data.extras["state_extras"]["truncation"]
         )
-        dynamics_fn = make_dynamics((jnp.zeros(1), training_state.params.dynamics))
-
-        state, data = generate_unroll(
-            env,
-            model_rollout_env,
-            state,
-            forward_fn,
-            representation_fn,
-            dynamics_fn,
-            key_generate_unroll,
-            Config.unroll_length,
-            deterministic_actions=False,
-            extra_fields=("truncation",),
-        )
-
-        # additional search at final step for bootstrap values
-        _, transition = actor_step(
-            env,
-            model_rollout_env,
-            state,
-            forward_fn,
-            representation_fn,
-            dynamics_fn,
-            key_bootstrap,
-            deterministic_actions=False,
-            extra_fields=("truncation",),
-        )
-
-        assert data.discount.shape[0] == Config.unroll_length
 
         (
             value_prefix_targets,
@@ -2092,24 +2594,22 @@ def main(_):
         ) = n_step_fn(
             rewards=data.reward,
             discounts=data.discount * (1 - data.extras["state_extras"]["truncation"]),
-            termination_discount=data.discount,
+            # GAE sees truncation separately and only cuts the lambda-chain there
+            termination_discount=1.0 - termination,
             observations=data.next_observation,
             values=jnp.concatenate(
                 [data.search_value, jnp.array([transition.search_value])]
             ),
         )
-        # value_prefix_targets = jnp.zeros_like(value_prefix_targets)
-        # bootstrap_discounts = jnp.ones_like(bootstrap_discounts)
-        # bootstrap_values = data.search_value
 
         # NOTE: data.bootstap_value is overloaded with the prior values
         targets = (
             jnp.expand_dims(value_prefix_targets, -1)
             + jnp.expand_dims(bootstrap_discounts, -1) * bootstrap_values
         )
-        priorities = (
-            jnp.mean(jnp.abs(targets - data.bootstrap_value), axis=-1) + 1e-10
-        ) ** Config.per_alpha
+        priorities = replay_priorities(
+            targets, data.bootstrap_value, data, representation_fn, dynamics_fn
+        )
 
         data = data._replace(
             value_prefix_target=value_prefix_targets,
@@ -2141,7 +2641,12 @@ def main(_):
             unroll_actions,
             unroll_mask,
             terminal_mask,
-        ) = collect_targets(targets, 1 - data.discount, Config.loss_unroll_length)
+        ) = collect_targets(
+            targets,
+            termination,  # real termination only (absorbing states)
+            Config.loss_unroll_length,
+            truncation=truncation,
+        )
 
         data = data._replace(
             unroll_obs=unroll_obs,
@@ -2155,6 +2660,82 @@ def main(_):
             unroll_mask=unroll_mask,
             terminal_mask=terminal_mask,
         )
+        return data, termination, truncation
+
+    def training_step(
+        carry: tuple[TrainingState, State, ReplayBufferState, jnp.ndarray], unused_t
+    ) -> tuple[tuple[TrainingState, State, ReplayBufferState, jnp.ndarray], Metrics]:
+        training_state, state, buffer_state, key = carry
+        key_sgd, key_generate_unroll, key_bootstrap, _reanalyze_key, new_key = (
+            jax.random.split(key, 5)
+        )
+
+        forward_fn = make_forward(
+            (
+                jnp.zeros(1),
+                training_state.params.policy,
+                training_state.params.value,
+                training_state.params.feature_extractor,
+            )
+        )
+
+        representation_fn = make_representation(
+            (training_state.normalizer_params, training_state.params.representation)
+        )
+        dynamics_fn = make_dynamics((jnp.zeros(1), training_state.params.dynamics))
+
+        state, data = generate_unroll(
+            env,
+            model_rollout_env,
+            state,
+            forward_fn,
+            representation_fn,
+            dynamics_fn,
+            key_generate_unroll,
+            Config.unroll_length,
+            deterministic_actions=False,
+            extra_fields=("truncation", "steps"),  # GOAL DIAGNOSTIC: + steps
+        )
+
+        # additional search at final step for bootstrap values
+        _, transition = actor_step(
+            env,
+            model_rollout_env,
+            state,
+            forward_fn,
+            representation_fn,
+            dynamics_fn,
+            key_bootstrap,
+            deterministic_actions=False,
+            extra_fields=("truncation", "steps"),  # GOAL DIAGNOSTIC: + steps
+        )
+
+        assert data.discount.shape[0] == Config.unroll_length
+
+        data, termination, truncation = process_unroll(
+            data, transition, representation_fn, dynamics_fn
+        )
+
+        # search diagnostics from this unroll (acting time)
+        search_diagnostics = {
+            "search_entropy": jnp.mean(data.extras["policy_extras"]["search_entropy"]),
+            "search_prior_entropy": jnp.mean(
+                data.extras["policy_extras"]["prior_entropy"]
+            ),
+            "search_root_q_spread": jnp.mean(
+                data.extras["policy_extras"]["root_q_spread"]
+            ),
+            # goal terminations / time limits in the freshly
+            # collected training unroll (ratios derived per epoch, see
+            # training_epoch_with_timing)
+            "train_goals": jnp.sum(termination),
+            "train_timeouts": jnp.sum(truncation),
+            # sum of lengths of the episodes that ended in this unroll (the
+            # wrapper's step counter at the done step is the episode length)
+            "train_episode_length_sum": jnp.sum(
+                (termination + truncation) * data.extras["state_extras"]["steps"]
+            ),
+        }
 
         # Have leading dimensions (batch_size * num_minibatches, unroll_length)
         # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
@@ -2183,6 +2764,30 @@ def main(_):
         # sampling from replay buffer
         buffer_state, data = replay_buffer.sample(buffer_state)
 
+        # fraction of goal transitions (real termination at
+        # k=0) in the sampled training batch = the goal signal the nets see
+        sampled_termination, _ = split_termination_truncation(
+            data.discount, data.extras["state_extras"]["truncation"]
+        )
+        search_diagnostics["train_batch_goal_frac"] = jnp.mean(sampled_termination)
+
+        # PER: anneal the importance-sampling exponent beta from
+        # per_beta_start to per_beta_end over training. The buffer returns
+        # weights for beta = 1 normalised by the batch max; raising them to the
+        # power beta gives exactly the batch-max-normalised weights for beta.
+        if Config.per_beta_anneal:
+            beta_progress = jnp.clip(
+                (training_state.env_steps - num_prefill_env_steps)
+                / (Config.total_timesteps - num_prefill_env_steps),
+                0.0,
+                1.0,
+            )
+            per_beta = Config.per_beta_start + beta_progress * (
+                Config.per_beta_end - Config.per_beta_start
+            )
+            data = data._replace(weight=data.weight**per_beta)
+            search_diagnostics["per_beta"] = per_beta
+
         # reanalyze
         # data = reanalyze_fn(data, forward_fn, env, reanalyze_key)
 
@@ -2207,14 +2812,25 @@ def main(_):
         )
         hidden = representation_fn(data.observation)
         values = forward_fn(hidden)[1]
-        priorities = (
-            jnp.mean(jnp.abs(targets - values), axis=-1) + 1e-10
-        ) ** Config.per_alpha
+        priorities = replay_priorities(
+            targets, values, data, representation_fn, dynamics_fn
+        )
         buffer_state = replay_buffer.set_priorities(
             buffer_state, jnp.squeeze(priorities)
         )
 
         metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
+        # log the lr used in this training step (the optimizer count = number
+        # of updates done so far)
+        if callable(learning_rate):
+            updates_done = (
+                (training_state.env_steps - num_prefill_env_steps)
+                / env_step_per_training_step
+                * Config.update_epochs
+                * Config.num_minibatches
+            )
+            metrics["learning_rate"] = learning_rate(updates_done)
+        metrics.update(search_diagnostics)
         return (new_training_state, state, buffer_state, new_key), metrics
 
     def training_epoch(
@@ -2222,7 +2838,7 @@ def main(_):
         state: State,
         buffer_state: ReplayBufferState,
         key: jnp.ndarray,
-    ) -> Tuple[TrainingState, State, ReplayBufferState, Metrics]:
+    ) -> tuple[TrainingState, State, ReplayBufferState, Metrics]:
         (training_state, state, buffer_state, _), loss_metrics = jax.lax.scan(
             training_step,
             (training_state, state, buffer_state, key),
@@ -2240,7 +2856,7 @@ def main(_):
         env_state: State,
         buffer_state: ReplayBufferState,
         key: jnp.ndarray,
-    ) -> Tuple[TrainingState, State, ReplayBufferState, Metrics]:
+    ) -> tuple[TrainingState, State, ReplayBufferState, Metrics]:
         nonlocal training_walltime
         t = time.time()
         training_state, env_state = _strip_weak_type(
@@ -2271,6 +2887,21 @@ def main(_):
             "training/epoch_training_time": np.round(epoch_training_time),
             **{f"training/{name}": float(value) for name, value in metrics.items()},
         }
+        # goal diagnostics: ratios of epoch sums (means of per-step counts), so
+        # training steps without any finished episode do not bias them
+        if "training/train_goals" in metrics:
+            episode_ends = (
+                metrics["training/train_goals"] + metrics["training/train_timeouts"]
+            )
+            episode_length_sum = metrics.pop("training/train_episode_length_sum")
+            metrics["training/train_goal_frac"] = (
+                metrics["training/train_goals"] / episode_ends
+                if episode_ends > 0
+                else 0.0
+            )
+            metrics["training/train_episode_length"] = (
+                episode_length_sum / episode_ends if episode_ends > 0 else float("nan")
+            )
         return (
             training_state,
             env_state,
@@ -2283,7 +2914,7 @@ def main(_):
         env_state: State,
         buffer_state: ReplayBufferState,
         key: jnp.ndarray,
-    ) -> Tuple[TrainingState, State, ReplayBufferState, jnp.ndarray]:
+    ) -> tuple[TrainingState, State, ReplayBufferState, jnp.ndarray]:
 
         key_generate_unroll, key_bootstrap, new_key = jax.random.split(key, 3)
 
@@ -2312,7 +2943,7 @@ def main(_):
             key_generate_unroll,
             num_prefill_actor_steps,
             deterministic_actions=False,
-            extra_fields=("truncation",),
+            extra_fields=("truncation", "steps"),  # GOAL DIAGNOSTIC: + steps
         )
 
         # additional search at final step for bootstrap values
@@ -2325,82 +2956,12 @@ def main(_):
             dynamics_fn,
             key_bootstrap,
             deterministic_actions=False,
-            extra_fields=("truncation",),
+            extra_fields=("truncation", "steps"),  # GOAL DIAGNOSTIC: + steps
         )
 
         assert data.discount.shape[0] == num_prefill_actor_steps
 
-        (
-            value_prefix_targets,
-            bootstrap_observations,
-            bootstrap_values,
-            bootstrap_discounts,
-        ) = n_step_fn(
-            rewards=data.reward,
-            discounts=data.discount * (1 - data.extras["state_extras"]["truncation"]),
-            termination_discount=data.discount,
-            observations=data.next_observation,
-            values=jnp.concatenate(
-                [data.search_value, jnp.array([transition.search_value])]
-            ),
-        )
-        # value_prefix_targets = jnp.zeros_like(value_prefix_targets)
-        # bootstrap_discounts = jnp.ones_like(bootstrap_discounts)
-        # bootstrap_values = data.search_value
-
-        # NOTE: data.bootstap_value is overloaded with the prior values
-        targets = (
-            jnp.expand_dims(value_prefix_targets, -1)
-            + jnp.expand_dims(bootstrap_discounts, -1) * bootstrap_values
-        )
-        priorities = (
-            jnp.mean(jnp.abs(targets - data.bootstrap_value), axis=-1) + 1e-10
-        ) ** Config.per_alpha
-
-        data = data._replace(
-            value_prefix_target=value_prefix_targets,
-            bootstrap_observation=bootstrap_observations,
-            bootstrap_value=bootstrap_values,
-            bootstrap_discount=bootstrap_discounts,
-            priority=priorities,
-        )
-
-        # calculate targets per step for unrolling loss function
-        targets = (
-            data.observation,
-            data.target_policy_probs,
-            data.value_prefix_target,
-            data.bootstrap_discount,
-            data.bootstrap_value,
-            data.bootstrap_observation,
-            data.reward,
-            data.action,
-        )
-        (
-            unroll_obs,
-            policy_targets,
-            value_prefix_targets,
-            bootstrap_discounts,
-            bootstrap_values,
-            bootstrap_observations,
-            reward_targets,
-            unroll_actions,
-            unroll_mask,
-            terminal_mask,
-        ) = collect_targets(targets, 1 - data.discount, Config.loss_unroll_length)
-
-        data = data._replace(
-            unroll_obs=unroll_obs,
-            policy_targets=policy_targets,
-            value_prefix_targets=value_prefix_targets,
-            bootstrap_discounts=bootstrap_discounts,
-            bootstrap_values=bootstrap_values,
-            bootstrap_observations=bootstrap_observations,
-            reward_targets=reward_targets,
-            unroll_actions=unroll_actions,
-            unroll_mask=unroll_mask,
-            terminal_mask=terminal_mask,
-        )
+        data, _, _ = process_unroll(data, transition, representation_fn, dynamics_fn)
 
         # Have leading dimensions (batch_size * num_minibatches, unroll_length)
         # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
@@ -2459,10 +3020,6 @@ def main(_):
             representation=az_network.representation_network.init(key_representation),
             dynamics=az_network.dynamics_network.init(key_dynamics),
         )
-    # else:
-    #     init_params = AZNetworkParams(
-    #         policy=az_network.policy_network.init(key_policy),
-    #         value=az_network.value_network.init(key_value))
     training_state = TrainingState(  # pytype: disable=wrong-arg-types  # jax-ndarray
         optimizer_state=optimizer.init(
             init_params
@@ -2487,6 +3044,7 @@ def main(_):
         action_repeat=Config.action_repeat,
     )
 
+    # eval/*: most visited root action, no root Dirichlet noise (MuZero)
     evaluator = Evaluator(
         eval_env,
         model_rollout_env,
@@ -2498,12 +3056,62 @@ def main(_):
         action_repeat=Config.action_repeat,
         key=eval_key,
         deterministic_eval=Config.deterministic_eval,
+        visit_count_actions=True,
     )
+
+    # optional eval_argmax_q/*: argmax Q over visited root actions, with root
+    # noise. Same eval_key -> both evaluators play the same start states.
+    evaluator_argmax_q = None
+    if Config.eval_argmax_q:
+        evaluator_argmax_q = Evaluator(
+            eval_env,
+            model_rollout_env,
+            make_forward,
+            make_representation,
+            make_dynamics,
+            num_eval_envs=Config.num_eval_envs,
+            episode_length=Config.episode_length,
+            action_repeat=Config.action_repeat,
+            key=eval_key,
+            deterministic_eval=Config.deterministic_eval,
+            visit_count_actions=False,
+        )
+
+    # planning diagnostics: model search vs true-environment search (eval only)
+    planning_diagnostics = None
+    if Config.planning_diagnostics:
+        planning_diagnostics = PlanningDiagnostics(
+            eval_env,
+            model_rollout_env,
+            make_forward,
+            make_representation,
+            make_dynamics,
+            num_envs=Config.num_eval_envs,
+            episode_length=Config.episode_length,
+            key=jax.random.fold_in(eval_key, 1),
+        )
+
+    def run_evaluations(policy_params):
+        metrics = evaluator.run_evaluation(policy_params, training_metrics={})
+        if evaluator_argmax_q is not None:
+            argmax_q_metrics = evaluator_argmax_q.run_evaluation(
+                policy_params, training_metrics={}
+            )
+            metrics.update(
+                {
+                    k.replace("eval/", "eval_argmax_q/", 1): v
+                    for k, v in argmax_q_metrics.items()
+                    if k.startswith("eval/")
+                }
+            )
+        if planning_diagnostics is not None:
+            metrics.update(planning_diagnostics.run(policy_params))
+        return metrics
 
     # Run initial eval
     metrics = {}
     if process_id == 0 and eval_env:
-        metrics = evaluator.run_evaluation(
+        metrics = run_evaluations(
             _unpmap(
                 (
                     training_state.normalizer_params,
@@ -2514,70 +3122,8 @@ def main(_):
                     training_state.params.dynamics,
                 )
             ),
-            training_metrics={},
         )
         logging.info(metrics)
-        # progress_fn(0, metrics)
-
-        # plotting: TEMP, REMOVE AGAIN ###########################################
-        # plotting_forwad = make_forward((_unpmap(
-        #         (training_state.normalizer_params, training_state.params.policy,
-        #          training_state.params.value, training_state.params.feature_extractor)
-        #         )))
-        # deterministic_actions = True
-        # plotting_key = jax.random.PRNGKey(17)
-        # reset_key, unroll_key = jax.random.split(plotting_key)
-        # reset_keys = jax.random.split(reset_key, Config.num_eval_envs)
-        # plotting_state = eval_env.reset(reset_keys)
-
-        # step_count = 0
-        # while plotting_state.done[0] < 1 and plotting_state.info['truncation'][0] < 1:
-        #     print(step_count)
-        #     search_rng, unroll_key = jax.random.split(unroll_key)
-
-        #     prior_logits, value = plotting_forwad(plotting_state.obs)
-        #     use_mixed_value = False
-        #     root = mctx.RootFnOutput(
-        #         prior_logits=prior_logits,
-        #         value=value,
-        #         embedding=plotting_state,
-        #     )
-
-        #     def recurrent_fn(params, rng_key, action, embedding):
-        #         env_state = embedding
-        #         nstate = model_rollout_env.step(env_state, action)
-        #         prior_logits, value = plotting_forwad(env_state.obs)
-
-        #         recurrent_fn_output = mctx.RecurrentFnOutput(
-        #             reward=nstate.reward,
-        #             discount=1 - nstate.done,
-        #             prior_logits=prior_logits,
-        #             value=value,
-        #         )
-        #         return recurrent_fn_output, nstate
-
-        #     policy_output = mctx.gumbel_muzero_policy(
-        #         params=(),
-        #         rng_key=search_rng,
-        #         root=root,
-        #         recurrent_fn=recurrent_fn,
-        #         num_simulations=Config.num_simulations,
-        #         max_num_considered_actions=Config.max_num_considered_actions,
-        #         qtransform=partial(
-        #             mctx.qtransform_completed_by_mix_value,
-        #             use_mixed_value=use_mixed_value),
-        #     )
-
-        #     actions = policy_output.action
-        #     action_weights = policy_output.action_weights
-        #     best_actions = jnp.argmax(action_weights, axis=-1).astype(jnp.int32)
-        #     actions = jax.lax.select(deterministic_actions, best_actions, actions)
-
-        #     mctx.draw_tree_to_file(policy_output.search_tree, f'plots/search_tree_00_{step_count}.png')
-
-        #     plotting_state = eval_env.step(plotting_state, actions)
-        #     step_count += 1
-        # plotting: TEMP, REMOVE AGAIN ###########################################
 
     # prefill replay buffer
     start_prefill = time.time()
@@ -2629,7 +3175,7 @@ def main(_):
 
         if process_id == 0:
             # Run evals.
-            metrics = evaluator.run_evaluation(
+            metrics = run_evaluations(
                 _unpmap(
                     (
                         training_state.normalizer_params,
@@ -2640,7 +3186,6 @@ def main(_):
                         training_state.params.dynamics,
                     )
                 ),
-                training_metrics={},
             )
 
             # record scores
@@ -2653,99 +3198,7 @@ def main(_):
                 )
             )
 
-            # eval_metrics = {
-            #         'eval/num_episodes': len(eval_returns),
-            #         'eval/num_steps': eval_steps,
-            #         'eval/mean_score': np.round(np.mean(eval_returns), 3),
-            #         'eval/std_score': np.round(np.std(eval_returns), 3),
-            #         'eval/mean_episode_length': np.mean(eval_ep_lengths),
-            #         'eval/std_episode_length': np.round(np.std(eval_ep_lengths), 3),
-            #         'eval/eval_time': eval_time,
-            #     }
-
             logging.info(metrics)
-            # progress_fn(current_step, metrics)
-
-            # OPTIONAL: save checkpoints of models here
-            # params = _unpmap(
-            #     (training_state.normalizer_params, training_state.params.policy))
-
-            # plotting: TEMP, REMOVE AGAIN ###########################################
-            # plotting_forwad = make_forward((_unpmap(
-            #         (training_state.normalizer_params, training_state.params.policy,
-            #         training_state.params.value, training_state.params.feature_extractor)
-            #         )))
-            # deterministic_actions = True
-            # plotting_key = jax.random.PRNGKey(17)
-            # reset_key, unroll_key = jax.random.split(plotting_key)
-            # reset_keys = jax.random.split(reset_key, Config.num_eval_envs)
-            # plotting_state = eval_env.reset(reset_keys)
-
-            # step_count = 0
-            # while plotting_state.done[0] < 1 and plotting_state.info['truncation'][0] < 1:
-            #     search_rng, unroll_key = jax.random.split(unroll_key)
-
-            #     prior_logits, value = plotting_forwad(plotting_state.obs)
-            #     use_mixed_value = False
-            #     root = mctx.RootFnOutput(
-            #         prior_logits=prior_logits,
-            #         value=value,
-            #         embedding=plotting_state,
-            #     )
-
-            #     def recurrent_fn(params, rng_key, action, embedding):
-            #         env_state = embedding
-            #         nstate = model_rollout_env.step(env_state, action)
-            #         prior_logits, value = plotting_forwad(nstate.obs)
-
-            #         recurrent_fn_output = mctx.RecurrentFnOutput(
-            #             reward=nstate.reward,
-            #             discount=Config.n_step_gamma * jnp.where(
-            #                 nstate.info['truncation'], jnp.ones_like(nstate.done), 1 - nstate.done
-            #             ), #1 - nstate.done,
-            #             prior_logits=prior_logits,
-            #             value=value,
-            #         )
-            #         return recurrent_fn_output, nstate
-
-            #     # policy_output = mctx.gumbel_muzero_policy(
-            #     #     params=(),
-            #     #     rng_key=search_rng,
-            #     #     root=root,
-            #     #     recurrent_fn=recurrent_fn,
-            #     #     num_simulations=Config.num_simulations,
-            #     #     max_num_considered_actions=Config.max_num_considered_actions,
-            #     #     qtransform=partial(
-            #     #         mctx.qtransform_completed_by_mix_value,
-            #     #         use_mixed_value=use_mixed_value),
-            #     # )
-
-            #     policy_output = mctx.sampled_muzero_policy(
-            #         params=(),
-            #         rng_key=search_rng,
-            #         root=root,
-            #         recurrent_fn=recurrent_fn,
-            #         num_simulations=Config.num_simulations,
-            #         dirichlet_fraction=0.25,
-            #         dirichlet_alpha=0.3,
-            #         pb_c_init=1.25,# 1.25,
-            #         pb_c_base=19652, #19652,
-            #         temperature=1.0,
-            #     )
-
-            #     print_done = (1 - plotting_state.done[0]) * (1 - plotting_state.info['truncation'][0])
-            #     # print(step_count, value[0], policy_output.search_tree.summary().value[0], print_done)
-
-            #     actions = policy_output.action
-            #     action_weights = policy_output.action_weights
-            #     best_actions = jnp.argmax(jnp.mean(policy_output.search_tree.summary().qvalues, axis=-1), axis=-1).astype(jnp.int32)
-            #     actions = jax.lax.select(deterministic_actions, best_actions, actions)
-
-            #     mctx.draw_tree_to_file(policy_output.search_tree, f'plots/search_tree_{it}_{step_count}.png')
-
-            #     plotting_state = eval_env.step(plotting_state, actions)
-            #     step_count += 1
-            # plotting: TEMP, REMOVE AGAIN ###########################################
 
     # END OF TRAINING
 
@@ -2759,24 +3212,6 @@ def main(_):
         with open(os.path.join(run_dir, "scores.pkl"), "wb") as f:
             pickle.dump(scores, f)
 
-    # if Config.save_model:
-    #     model_path = f"weights/{run_name}.params"
-    #     with open(model_path, "wb") as f:
-    #         f.write(
-    #             flax.serialization.to_bytes(
-    #                 [
-    #                     vars(Config),
-    #                     [
-    #                         training_state.params.policy,
-    #                         training_state.params.value,
-    #                         # agent_state.params.feature_extractor,
-    #                     ],
-    #                 ]
-    #             )
-    #         )
-    #     print(f"model saved to {model_path}")
-
-    # envs.close()
 
     total_steps = current_step
     assert total_steps >= Config.total_timesteps

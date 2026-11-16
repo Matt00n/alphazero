@@ -16,15 +16,16 @@
 """Numpy backend for JAX that is called for non-jit/non-jax arrays."""
 
 import builtins
-from typing import Any, Callable, List, Optional, Sequence, Tuple, TypeVar, Union
 import warnings
+from collections.abc import Callable, Sequence
+from typing import Any, TypeVar
 
 import jax
+import numpy as onp
 from jax import custom_jvp
 from jax import numpy as jnp
-import numpy as onp
 
-ndarray = Union[onp.ndarray, jnp.ndarray]  # pylint:disable=invalid-name
+ndarray = onp.ndarray | jnp.ndarray  # pylint:disable=invalid-name
 tree_map = jax.tree_util.tree_map  # works great with jax or numpy as-is
 pi = onp.pi
 inf = onp.inf
@@ -57,7 +58,7 @@ def _which_np(*args):
 F = TypeVar('F', bound=Callable)
 
 
-def vmap(fun: F, include: Optional[Sequence[bool]] = None) -> F:
+def vmap(fun: F, include: Sequence[bool] | None = None) -> F:
   """Creates a function which maps ``fun`` over argument axes."""
   if _in_jit():
     in_axes = 0
@@ -103,12 +104,12 @@ X = TypeVar('X')
 Y = TypeVar('Y')
 
 
-def scan(f: Callable[[Carry, X], Tuple[Carry, Y]],
+def scan(f: Callable[[Carry, X], tuple[Carry, Y]],
          init: Carry,
          xs: X,
-         length: Optional[int] = None,
+         length: int | None = None,
          reverse: bool = False,
-         unroll: int = 1) -> Tuple[Carry, Y]:
+         unroll: int = 1) -> tuple[Carry, Y]:
   """Scan a function over leading array axes while carrying along state."""
   if _in_jit():
     return jax.lax.scan(f, init, xs, length, reverse, unroll)
@@ -152,18 +153,18 @@ def fori_loop(lower: int, upper: int, body_fun: Callable[[int, X], X],
 
 
 def take(
-    tree: Any, i: Union[int, ndarray, Sequence[int]], axis: int = 0
+    tree: Any, i: int | ndarray | Sequence[int], axis: int = 0
 ) -> Any:
   """Returns tree sliced by i."""
   np = _which_np(i)
-  if isinstance(i, list) or isinstance(i, tuple):
+  if isinstance(i, (list, tuple)):
     i = np.array(i, dtype=int)
   return jax.tree_util.tree_map(lambda x: np.take(x, i, axis=axis, mode='clip'),
                                 tree)
 
 
 def norm(x: ndarray,
-         axis: Optional[Union[Tuple[int, ...], int]] = None) -> ndarray:
+         axis: tuple[int, ...] | int | None = None) -> ndarray:
   """Returns the array norm."""
   return _which_np(x, axis).linalg.norm(x, axis=axis)
 
@@ -178,7 +179,7 @@ def index_update(x: ndarray, idx: ndarray, y: ndarray) -> ndarray:
 
 
 def safe_norm(x: ndarray,
-              axis: Optional[Union[Tuple[int, ...], int]] = None) -> ndarray:
+              axis: tuple[int, ...] | int | None = None) -> ndarray:
   """Calculates a linalg.norm(x) that's safe for gradients at x=0.
 
   Avoids a poorly defined gradient for jnp.linal.norm(0) see
@@ -203,28 +204,28 @@ def safe_norm(x: ndarray,
 
 
 def expand_dims(x: ndarray,
-                axis: Union[Tuple[int, ...], int] = 0) -> ndarray:
+                axis: tuple[int, ...] | int = 0) -> ndarray:
   """Increases batch dimensionality along axis."""
 
   return _which_np(x).expand_dims(x, axis=axis)
 
 
-def any(a: ndarray, axis: Optional[int] = None) -> ndarray:
+def any(a: ndarray, axis: int | None = None) -> ndarray:
   """Test whether any array element along a given axis evaluates to True."""
   return _which_np(a).any(a, axis=axis)
 
 
-def all(a: ndarray, axis: Optional[int] = None) -> ndarray:
+def all(a: ndarray, axis: int | None = None) -> ndarray:
   """Test whether all array elements along a given axis evaluate to True."""
   return _which_np(a).all(a, axis=axis)
 
 
-def mean(a: ndarray, axis: Optional[int] = None) -> ndarray:
+def mean(a: ndarray, axis: int | None = None) -> ndarray:
   """Compute the arithmetic mean along the specified axis."""
   return _which_np(a).mean(a, axis=axis)
 
 
-def var(a: ndarray, axis: Optional[int] = None) -> ndarray:
+def var(a: ndarray, axis: int | None = None) -> ndarray:
   """Compute the variance along the specified axis."""
   return _which_np(a).var(a, axis=axis)
 
@@ -264,15 +265,15 @@ def square(x: ndarray) -> ndarray:
   return _which_np(x).square(x)
 
 
-def tile(x: ndarray, reps: Union[Tuple[int, ...], int]) -> ndarray:
+def tile(x: ndarray, reps: tuple[int, ...] | int) -> ndarray:
   """Construct an array by repeating A the number of times given by reps."""
   return _which_np(x).tile(x, reps)
 
 
-def repeat(a: ndarray, repeats: Union[int, ndarray], *args,
+def repeat(a: ndarray, repeats: int | ndarray, *args,
            **kwargs) -> ndarray:
   """Repeat elements of an array."""
-  return _which_np(a, repeats).repeat(a, repeats=repeats, *args, **kwargs)
+  return _which_np(a, repeats).repeat(a, *args, repeats=repeats, **kwargs)
 
 
 def floor(x: ndarray) -> ndarray:
@@ -410,7 +411,7 @@ def sign(x: ndarray) -> ndarray:
   return _which_np(x).sign(x)
 
 
-def sum(a: ndarray, axis: Optional[int] = None):
+def sum(a: ndarray, axis: int | None = None):
   """Returns sum of array elements over a given axis."""
   return _which_np(a).sum(a, axis=axis)
 
@@ -425,9 +426,9 @@ def random_prngkey(seed: int) -> ndarray:
 
 
 def random_uniform(rng: ndarray,
-                   shape: Tuple[int, ...] = (),
-                   low: Optional[float] = 0.0,
-                   high: Optional[float] = 1.0) -> ndarray:
+                   shape: tuple[int, ...] = (),
+                   low: float | None = 0.0,
+                   high: float | None = 1.0) -> ndarray:
   """Sample uniform random values in [low, high) with given shape/dtype."""
   if _which_np(rng) is jnp:
     return jax.random.uniform(rng, shape=shape, minval=low, maxval=high)
@@ -445,9 +446,9 @@ def random_split(rng: ndarray, num: int = 2) -> ndarray:
 
 
 def randint(rng: ndarray,
-            shape: Tuple[int, ...] = (),
-            low: Optional[int] = 0,
-            high: Optional[int] = 1) -> ndarray:
+            shape: tuple[int, ...] = (),
+            low: int | None = 0,
+            high: int | None = 1) -> ndarray:
   """Sample integers in [low, high) with given shape."""
   if _which_np(rng) is jnp:
     return jax.random.randint(rng, shape=shape, minval=low, maxval=high)
@@ -456,10 +457,10 @@ def randint(rng: ndarray,
 
 
 def choice(rng: ndarray,
-           a: Union[int, Any],
-           shape: Tuple[int, ...] = (),
+           a: int | Any,
+           shape: tuple[int, ...] = (),
            replace: bool = True,
-           p: Optional[Any] = None,
+           p: Any | None = None,
            axis: int = 0) -> ndarray:
   """Generate sample(s) from given array."""
   if _which_np(rng) is jnp:
@@ -472,7 +473,7 @@ def choice(rng: ndarray,
 
 def segment_sum(data: ndarray,
                 segment_ids: ndarray,
-                num_segments: Optional[int] = None) -> ndarray:
+                num_segments: int | None = None) -> ndarray:
   """Computes the sum within segments of an array."""
   if _which_np(data, segment_ids) is jnp:
     s = jax.ops.segment_sum(data, segment_ids, num_segments)
@@ -494,7 +495,7 @@ def top_k(operand: ndarray, k: int) -> ndarray:
     return operand[sorted_ind], sorted_ind  # pytype: disable=bad-return-type  # jax-ndarray
 
 
-def stack(x: List[ndarray], axis=0) -> ndarray:
+def stack(x: list[ndarray], axis=0) -> ndarray:
   """Join a sequence of arrays along a new axis."""
   return _which_np(*x).stack(x, axis=axis)
 
@@ -562,7 +563,7 @@ def ones_like(a: ndarray) -> ndarray:
   return _which_np(a).ones_like(a)
 
 
-def reshape(a: ndarray, newshape: Union[Tuple[int, ...], int]) -> ndarray:
+def reshape(a: ndarray, newshape: tuple[int, ...] | int) -> ndarray:
   """Gives a new shape to an array without changing its data."""
   return _which_np(a).reshape(a, newshape)
 

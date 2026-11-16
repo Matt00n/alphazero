@@ -2,24 +2,24 @@
 """A brax environment for training and inference."""
 
 import abc
-from typing import Any, Dict, Optional
+from typing import Any
 
-from flax import struct
 import jax
+from flax import struct
 
-from envs.state import State, Base
+from envs.state import Base, State
 
 
 @struct.dataclass
 class State(Base):
     """Environment state for training and inference."""
 
-    pipeline_state: Optional[State]
+    pipeline_state: State | None
     obs: jax.Array
     reward: jax.Array
     done: jax.Array
-    metrics: Dict[str, jax.Array] = struct.field(default_factory=dict)
-    info: Dict[str, Any] = struct.field(default_factory=dict)
+    metrics: dict[str, jax.Array] = struct.field(default_factory=dict)
+    info: dict[str, Any] = struct.field(default_factory=dict)
 
 
 class Env(abc.ABC):

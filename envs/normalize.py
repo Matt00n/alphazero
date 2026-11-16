@@ -1,7 +1,7 @@
 import inspect
 import pickle
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -13,9 +13,8 @@ from envs.state import State
 from envs.utils import check_shape_equal, is_image_space
 
 
-
 class RunningMeanStd:
-    def __init__(self, epsilon: float = 1e-4, shape: Tuple[int, ...] = ()):
+    def __init__(self, epsilon: float = 1e-4, shape: tuple[int, ...] = ()):
         """
         Calulates the running mean and std of a data stream
         https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
@@ -95,7 +94,7 @@ class VecNormalize(VecEnvWrapper):
         clip_reward: float = 10.0,
         gamma: float = 0.99,
         epsilon: float = 1e-8,
-        norm_obs_keys: Optional[List[str]] = None,
+        norm_obs_keys: list[str] | None = None,
     ):
         VecEnvWrapper.__init__(self, venv)
 
@@ -110,7 +109,7 @@ class VecNormalize(VecEnvWrapper):
                 self.obs_rms = {key: RunningMeanStd(shape=self.obs_spaces[key].shape) for key in self.norm_obs_keys}
                 # Update observation space when using image
                 # See explanation below and GH #1214
-                for key in self.obs_rms.keys():
+                for key in self.obs_rms:
                     if is_image_space(self.obs_spaces[key]):
                         self.observation_space.spaces[key] = spaces.Box(
                             low=-clip_obs,
@@ -162,7 +161,7 @@ class VecNormalize(VecEnvWrapper):
             # Check that all keys are of type Box
             for obs_key in self.norm_obs_keys:
                 if not isinstance(self.observation_space.spaces[obs_key], spaces.Box):
-                    raise ValueError(
+                    raise TypeError(
                         f"VecNormalize only supports `gym.spaces.Box` observation spaces but {obs_key} "
                         f"is of type {self.observation_space.spaces[obs_key]}. "
                         "You should probably explicitely pass the observation keys "
@@ -174,12 +173,12 @@ class VecNormalize(VecEnvWrapper):
                 raise ValueError("`norm_obs_keys` param is applicable only with `gym.spaces.Dict` observation spaces")
 
         else:
-            raise ValueError(
+            raise TypeError(
                 "VecNormalize only supports `gym.spaces.Box` and `gym.spaces.Dict` observation spaces, "
                 f"not {self.observation_space}"
             )
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         """
         Gets state for pickling.
 
@@ -192,7 +191,7 @@ class VecNormalize(VecEnvWrapper):
         del state["returns"]
         return state
 
-    def __setstate__(self, state: Dict[str, Any]) -> None:
+    def __setstate__(self, state: dict[str, Any]) -> None:
         """
         Restores pickled state.
 
@@ -240,7 +239,7 @@ class VecNormalize(VecEnvWrapper):
 
         if self.training and self.norm_obs:
             if isinstance(obs, dict) and isinstance(self.obs_rms, dict):
-                for key in self.obs_rms.keys():
+                for key in self.obs_rms:
                     self.obs_rms[key].update(obs[key])
             else:
                 self.obs_rms.update(obs)
@@ -288,7 +287,7 @@ class VecNormalize(VecEnvWrapper):
         """
         return (obs * np.sqrt(obs_rms.var + self.epsilon)) + obs_rms.mean
 
-    def normalize_obs(self, obs: Union[np.ndarray, Dict[str, np.ndarray]]) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    def normalize_obs(self, obs: np.ndarray | dict[str, np.ndarray]) -> np.ndarray | dict[str, np.ndarray]:
         """
         Normalize observations using this VecNormalize's observations statistics.
         Calling this method does not update statistics.
@@ -313,7 +312,7 @@ class VecNormalize(VecEnvWrapper):
             reward = np.clip(reward / np.sqrt(self.ret_rms.var + self.epsilon), -self.clip_reward, self.clip_reward)
         return reward
 
-    def unnormalize_obs(self, obs: Union[np.ndarray, Dict[str, np.ndarray]]) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    def unnormalize_obs(self, obs: np.ndarray | dict[str, np.ndarray]) -> np.ndarray | dict[str, np.ndarray]:
         # Avoid modifying by reference the original object
         obs_ = deepcopy(obs)
         if self.norm_obs:
@@ -329,7 +328,7 @@ class VecNormalize(VecEnvWrapper):
             return reward * np.sqrt(self.ret_rms.var + self.epsilon)
         return reward
 
-    def get_original_obs(self) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    def get_original_obs(self) -> np.ndarray | dict[str, np.ndarray]:
         """
         Returns an unnormalized version of the observations from the most recent
         step or reset.
@@ -353,7 +352,7 @@ class VecNormalize(VecEnvWrapper):
         self.returns = np.zeros(self.num_envs)
         if self.training and self.norm_obs:
             if isinstance(obs, dict) and isinstance(self.obs_rms, dict):
-                for key in self.obs_rms.keys():
+                for key in self.obs_rms:
                     self.obs_rms[key].update(obs[key])
             else:
                 self.obs_rms.update(obs)

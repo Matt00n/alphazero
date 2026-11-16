@@ -1,17 +1,16 @@
 """AlphaZero reimplementation."""
 
-from absl import logging, app
-from functools import partial
 import os
 import pickle
 import random
 import time
-from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Union
+from collections.abc import Callable, Mapping, Sequence
+from functools import partial
+from typing import Any
 
 # os.environ[
 #     "XLA_PYTHON_CLIENT_MEM_FRACTION"
 # ] = "0.7"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
-
 import chex
 import flax
 import flax.linen as nn
@@ -19,19 +18,36 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import tensorflow_probability.substrates.jax.distributions as tfd # TODO: can be removed once transitioned to AZ loss
+import tensorflow_probability.substrates.jax.distributions as tfd  # TODO: can be removed once transitioned to AZ loss
+from absl import app, logging
 
-from envs import make_env, Transition, MCTSTransition, has_discrete_action_space, is_atari_env
-# from envs.brax_v1_wrappers import wrap_for_training
-from envs.brax_wrappers import EvalWrapper, wrap_for_training, VmapWrapper
-from networks.policy import Policy, ForwardPass
-from networks.networks import FeedForwardNetwork, ActivationFn, make_policy_network, make_value_network, make_atari_feature_extractor
-from networks.distributions import NormalTanhDistribution, ParametricDistribution, PolicyNormalDistribution, DiscreteDistribution
+import mctx_dist as mctx
 import replay_buffers
 import running_statistics
+from envs import (
+    MCTSTransition,
+    has_discrete_action_space,
+    is_atari_env,
+)
+
+# from envs.brax_v1_wrappers import wrap_for_training
+from envs.brax_wrappers import EvalWrapper, VmapWrapper, wrap_for_training
 from gymnax import gymnax
 from gymnax.gymnax.wrappers.brax import GymnaxToBraxWrapper, State
-import mctx_dist as mctx
+from networks.distributions import (
+    DiscreteDistribution,
+    NormalTanhDistribution,
+    ParametricDistribution,
+    PolicyNormalDistribution,
+)
+from networks.networks import (
+    ActivationFn,
+    FeedForwardNetwork,
+    make_atari_feature_extractor,
+    make_policy_network,
+    make_value_network,
+)
+from networks.policy import ForwardPass, Policy
 
 
 class Config:
@@ -75,7 +91,7 @@ class Config:
 
     # replay buffer
     min_replay_size: int = 8192
-    max_replay_size: Optional[int] = 8192 # 8192 # 16384
+    max_replay_size: int | None = 8192 # 8192 # 16384
     replay_buffer_batch_size: int = 128 # 256
     per_alpha: float = 0.
     per_importance_sampling: bool = True
@@ -99,7 +115,7 @@ class Config:
     # atari params
     atari_dense_layer_sizes: Sequence[int] = (256,) # (512,)
 
-InferenceParams = Tuple[running_statistics.NestedMeanStd, Any] # Not used
+InferenceParams = tuple[running_statistics.NestedMeanStd, Any] # Not used
 Metrics = Mapping[str, jnp.ndarray]
 ReplayBufferState = Any
 
@@ -129,7 +145,7 @@ class AZNetworkParams:
 class AZNetworks:
     policy_network: FeedForwardNetwork
     value_network: FeedForwardNetwork
-    parametric_action_distribution: Union[ParametricDistribution, DiscreteDistribution]
+    parametric_action_distribution: ParametricDistribution | DiscreteDistribution
 
 
 @flax.struct.dataclass
@@ -145,19 +161,19 @@ class AtariAZNetworks:
     feature_extractor: FeedForwardNetwork
     policy_network: FeedForwardNetwork
     value_network: FeedForwardNetwork
-    parametric_action_distribution: Union[ParametricDistribution, DiscreteDistribution]
+    parametric_action_distribution: ParametricDistribution | DiscreteDistribution
 
 
 @flax.struct.dataclass
 class TrainingState:
     """Contains training state for the learner."""
     optimizer_state: optax.OptState
-    params: Union[AZNetworkParams, AtariAZNetworkParams]
+    params: AZNetworkParams | AtariAZNetworkParams
     normalizer_params: running_statistics.RunningStatisticsState
     env_steps: jnp.ndarray
 
 
-def make_inference_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
+def make_inference_fn(az_networks: AZNetworks | AtariAZNetworks):
     """Creates params and inference function for the agent."""
 
     def make_policy(params: Any,
@@ -172,7 +188,7 @@ def make_inference_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
 
         @jax.jit # TODO jit needed ?
         def policy(observations: jnp.ndarray,
-                key_sample: jnp.ndarray) -> Tuple[jnp.ndarray, Mapping[str, Any]]:
+                key_sample: jnp.ndarray) -> tuple[jnp.ndarray, Mapping[str, Any]]:
             if use_feature_extractor:
                 observations = shared_feature_extractor.apply(normalizer_params, feature_extractor_params, observations)
             logits = policy_network.apply(normalizer_params, policy_params, observations)
@@ -193,7 +209,7 @@ def make_inference_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
     return make_policy
 
 
-def make_forward_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
+def make_forward_fn(az_networks: AZNetworks | AtariAZNetworks):
     """Creates params and inference function for the agent."""
 
     def make_forward(params: Any,
@@ -206,7 +222,7 @@ def make_forward_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
         normalizer_params, policy_params, value_params, feature_extractor_params = params
 
         @jax.jit # TODO jit needed ?
-        def forward_networks(observations: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        def forward_networks(observations: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
             if use_feature_extractor:
                 observations = shared_feature_extractor.apply(normalizer_params, feature_extractor_params, observations)
             
@@ -221,7 +237,7 @@ def make_forward_fn(az_networks: Union[AZNetworks, AtariAZNetworks]):
 
 
 def make_az_networks(
-        observation_size: Union[Sequence[int], int],
+        observation_size: Sequence[int] | int,
         action_size: int,
         num_atoms: int,
         preprocess_observation_fn: Callable, 
@@ -231,8 +247,8 @@ def make_az_networks(
         sqash_distribution: bool = True,
         discrete_policy: bool = False,
         shared_feature_extractor: bool = False,
-        feature_extractor_dense_hidden_layer_sizes: Optional[Sequence[int]] = (512,),
-    ) -> Union[AZNetworks, AtariAZNetworkParams]:
+        feature_extractor_dense_hidden_layer_sizes: Sequence[int] | None = (512,),
+    ) -> AZNetworks | AtariAZNetworkParams:
     """Make networks with preprocessor."""
     if discrete_policy:
         parametric_action_distribution = DiscreteDistribution(
@@ -292,15 +308,14 @@ def actor_step(
     key: jnp.ndarray,
     deterministic_actions: bool = False,
     extra_fields: Sequence[str] = (),
-) -> Tuple[State, MCTSTransition]:
+) -> tuple[State, MCTSTransition]:
     """Collect data."""
 
-    key, logits_rng, search_rng = jax.random.split(key, 3)
+    key, _logits_rng, search_rng = jax.random.split(key, 3)  # (keeps the rng streams)
 
     # logits at root produced by the prior policy 
     prior_logits, value = forward(env_state.obs)
-   
-    use_mixed_value = False
+
 
     # NOTE: For AlphaZero embedding is env_state, for MuZero
     # the root output would be the output of MuZero representation network.
@@ -412,7 +427,7 @@ def generate_unroll(
     unroll_length: int,
     deterministic_actions: bool = False,
     extra_fields: Sequence[str] = ()
-) -> Tuple[State, MCTSTransition]:
+) -> tuple[State, MCTSTransition]:
     """Collect trajectories of given unroll_length."""
 
     @jax.jit
@@ -549,7 +564,7 @@ def n_step_bootstrapped_targets(
         values: jnp.ndarray,
         n: int = 5,
         gamma: float = 1.,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Computes n-step bootstrapped return targets over a sequence.
 
     Args:
@@ -610,7 +625,7 @@ def compute_gae(
         values: jnp.ndarray,
         lambda_: float = 1.0,
         discount: float = 0.99,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Calculates the Generalized Advantage Estimation (GAE).
 
     Args:
@@ -721,17 +736,17 @@ def mse_value_loss(values: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
 
 
 def compute_muzero_loss(
-    params: Union[AZNetworkParams, AtariAZNetworkParams],
+    params: AZNetworkParams | AtariAZNetworkParams,
     normalizer_params: Any,
     data: MCTSTransition,
     rng: jnp.ndarray,
-    az_network: Union[AZNetworks, AtariAZNetworks],
+    az_network: AZNetworks | AtariAZNetworks,
     value_loss_fn: Callable[[Any], jnp.ndarray],
     vf_cost: float = 0.5,
     l2_coef: float = 1e-4,
     shared_feature_extractor: bool = False,
     per_importance_sampling: bool = True,
-) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
+) -> tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
     """Computes Alphazero loss .
 
     Args:
@@ -904,7 +919,6 @@ def main(_):
 
     # intialize replay buffer
     dummy_obs = jnp.zeros(observation_shape,)
-    dummy_action = jnp.zeros((action_size,))
     dummy_transition = MCTSTransition(  # pytype: disable=wrong-arg-types  # jax-ndarray
         observation=dummy_obs,
         real_obs=dummy_obs,
@@ -992,12 +1006,8 @@ def main(_):
         raise ValueError('num_atoms must be a positive integer.')
 
     if Config.reanalyze:
-        raise NotImplementedError
-        if Config.use_gae:
-            raise ValueError('Reanalyze not compatible with Generalized Advantage Estimation')
-        # reanalyze_fn = reanalyze
-    else:
-        reanalyze_fn = lambda x, a, b, c: x
+        # TODO: reanalyze; not functional yet
+        raise NotImplementedError('reanalyze is not implemented yet')
 
     # create loss function via functools.partial
     loss_fn = partial(
@@ -1012,7 +1022,7 @@ def main(_):
 
 
     def loss_and_pgrad(loss_fn: Callable[..., float],
-                        pmap_axis_name: Optional[str],
+                        pmap_axis_name: str | None,
                         has_aux: bool = False):
         g = jax.value_and_grad(loss_fn, has_aux=has_aux)
 
@@ -1025,7 +1035,7 @@ def main(_):
 
     def gradient_update_fn(loss_fn: Callable[..., float],
                             optimizer: optax.GradientTransformation,
-                            pmap_axis_name: Optional[str],
+                            pmap_axis_name: str | None,
                             has_aux: bool = False):
         """Wrapper of the loss function that apply gradient updates.
 
@@ -1090,11 +1100,11 @@ def main(_):
     
 
     def training_step(
-        carry: Tuple[TrainingState, State, ReplayBufferState, jnp.ndarray],
+        carry: tuple[TrainingState, State, ReplayBufferState, jnp.ndarray],
         unused_t
-    ) -> Tuple[Tuple[TrainingState, State, ReplayBufferState, jnp.ndarray], Metrics]:
+    ) -> tuple[tuple[TrainingState, State, ReplayBufferState, jnp.ndarray], Metrics]:
         training_state, state, buffer_state, key = carry
-        key_sgd, key_generate_unroll, key_bootstrap, reanalyze_key, new_key = jax.random.split(key, 5)
+        key_sgd, key_generate_unroll, key_bootstrap, _reanalyze_key, new_key = jax.random.split(key, 5)
 
         forward_fn = make_forward(
             (training_state.normalizer_params, training_state.params.policy, 
@@ -1183,7 +1193,7 @@ def main(_):
         return (new_training_state, state, buffer_state, new_key), metrics
 
     def training_epoch(training_state: TrainingState, state: State, buffer_state: ReplayBufferState,
-                        key: jnp.ndarray) -> Tuple[TrainingState, State, ReplayBufferState, Metrics]:
+                        key: jnp.ndarray) -> tuple[TrainingState, State, ReplayBufferState, Metrics]:
         (training_state, state, buffer_state, _), loss_metrics = jax.lax.scan(
             training_step, (training_state, state, buffer_state, key), (),
             length=num_training_steps_per_epoch)
@@ -1195,7 +1205,7 @@ def main(_):
     # Note that this is NOT a pure jittable method.
     def training_epoch_with_timing(
         training_state: TrainingState, env_state: State, buffer_state: ReplayBufferState,
-        key: jnp.ndarray) -> Tuple[TrainingState, State, ReplayBufferState, Metrics]:
+        key: jnp.ndarray) -> tuple[TrainingState, State, ReplayBufferState, Metrics]:
         nonlocal training_walltime
         t = time.time()
         training_state, env_state = _strip_weak_type((training_state, env_state)) # TODO also needed for replay buffer?
@@ -1224,7 +1234,7 @@ def main(_):
     def prefill_replay_buffer(
         training_state: TrainingState, env_state: State,
         buffer_state: ReplayBufferState, key: jnp.ndarray
-    ) -> Tuple[TrainingState, State, ReplayBufferState, jnp.ndarray]:
+    ) -> tuple[TrainingState, State, ReplayBufferState, jnp.ndarray]:
 
         key_generate_unroll, key_bootstrap, new_key = jax.random.split(key, 3)
 

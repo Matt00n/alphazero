@@ -15,7 +15,6 @@ This is a reimplementation of the infamous [AlphaZero](https://arxiv.org/abs/171
 
 ### Potential future extensions (if I have time...)
 
-* Consolidating the working [MuZero](https://arxiv.org/abs/1911.08265) (currently `muzero_ablate.py`, see below) into `muzero.py`.
 * Finishing REANALYZE.
 * Enable choosing MCTS version (standard, sampled, Gumbel, stochastic) via Config (has to be manually changed currently).
 * Support for continuous action spaces
@@ -23,11 +22,11 @@ This is a reimplementation of the infamous [AlphaZero](https://arxiv.org/abs/171
 
 ## MuZero
 
-The working MuZero currently lives in `muzero_ablate.py`. It will be consolidated into `muzero.py`. Every change relative to the original code is flagged with a `### TAG` comment, so `grep "### "` lists them.
+The working [MuZero](https://arxiv.org/abs/1911.08265) is `muzero.py`. It was consolidated from the step-by-step ablation in `muzero_ablate.py`, which keeps the full history: every change there is flagged with a `### TAG` comment, so `grep "### "` lists them.
 
 ### Results on Acrobot-v1
 
-Single seed (22), 1M environment steps. Evaluation uses the most-visited root action, without Dirichlet noise (`eval_visits/*`).
+Single seed (22), 1M environment steps. Evaluation uses the most-visited root action, without Dirichlet noise (`eval/*` in `muzero.py`, `eval_visits/*` in `muzero_ablate.py`).
 
 | Setup | Final return (last evaluations) |
 |---|---|
@@ -42,17 +41,17 @@ The optimum is around −60. A second seed for the quantile head is pending.
 
 ### Recommended settings
 
-These are the current defaults in `muzero_ablate.py`, unless the table says otherwise.
+These are the defaults in `muzero.py`, unless the table says otherwise.
 
 | Group | Setting | Value | Note |
 |---|---|---|---|
 | Value head | `categorical_value`, `num_atoms`, `qr_kappa` | `False`, `8`, `1.0` | Quantile regression on raw returns: no transform bias, no binning. `num_atoms=1` gives a scalar MSE head. |
 | Reward head | `reward_support_max` | `None` | MuZero's 601-atom categorical reward head. |
 | Value targets | `use_gae`, `gae_lambda`, `n_step_gamma` | `True`, `0.95`, `0.99` | GAE over the *stored* MCTS search values, as in AlphaZero. Do not bootstrap from the online network at loss time. |
-| Model | `learned_representation`, `learned_dynamics_search` | `True`, `True` | Full MuZero. Set either to `False` for oracle ablations. |
+| Model | `learned_dynamics_search` | `True` | Full MuZero. `False` runs the search on the true environment (oracle ablation). |
 | Unrolled loss | `loss_unroll_length` | `5` | |
 | Unrolled loss | `dynamics_gradient_scale` | `0.5` | MuZero's gradient scaling at the dynamics input. |
-| Unrolled loss | `muzero_loss_weighting` | `True` | Weight 1 at k=0 and 1/K for each k≥1. |
+| Unrolled loss | per-step loss weights | always on | Weight 1 at k=0 and 1/K for each k≥1, as in MuZero. |
 | Unrolled loss | `consistency_loss_coef` | `0.0` | Not in the original MuZero. 2.0 (EfficientZero) helped the scalar head bootstrap before reward-aware PER existed. |
 | Search | `num_simulations` | `50` | 100 is slightly better and twice as slow. |
 | Search | Dirichlet α, fraction; `pb_c_init`, `pb_c_base` | 0.3, 0.25; 1.25, 19652 | MuZero's values. |
@@ -61,17 +60,17 @@ These are the current defaults in `muzero_ablate.py`, unless the table says othe
 | Replay | `per_reward_priority_weight` | `1.0` | Priority = value error + reward error. This is what lets the agent bootstrap from rare goal transitions. |
 | Optimiser | `learning_rate`, `late_lr_decay`, `lr_decay_start_frac` | 1e-3, `True`, 0.8 | Constant, then linear decay to 1% over the last 20% of updates. |
 | Optimiser | `max_grad_norm` | `50` | Effectively a safety net. 0.5 clipped almost every update. |
-| Optimiser | `l2_coef`, `l2_exclude_bias_and_norm` | 1e-4, `True` | L2 on kernels only. L2 on LayerNorm gains collapsed the representation. |
+| Optimiser | `l2_coef` | 1e-4 | L2 on kernels only. L2 on LayerNorm gains collapsed the representation. |
 | Networks | embedding; representation, dynamics, value, policy layers | 64; 64×2, 64×2, 256×5, 32×4 (swish) | Larger networks bootstrapped much later. |
 | Data | `num_envs`, `unroll_length`, `total_timesteps` | 16, 128, 1e6 | |
-| Evaluation | `dual_eval_visit_counts` | `True` | Report `eval_visits/*` (most-visited action, no noise). `eval/*` is argmax-Q with noise. |
+| Evaluation | `eval_argmax_q` | `False` | `eval/*` uses the most-visited action without noise. `True` adds an argmax-Q evaluator with noise (`eval_argmax_q/*`). |
 
 ### Notes on tuning
 
 **Running experiments**
 - Runs are deterministic for a given seed and config. Compare variants on the same seed.
 - `eval_every` changes the epoch structure and the random streams, so keep it fixed when comparing.
-- Judge stability on `eval_visits/*`. Root Dirichlet noise in the `eval/*` evaluator makes good agents look unstable: one run read −74.8 ± 56 there and −62.5 ± 1.4 on `eval_visits/*`.
+- Judge stability on the visit-count evaluation (`eval/*`). Root Dirichlet noise in the argmax-Q evaluator makes good agents look unstable: one run read −74.8 ± 56 there and −62.5 ± 1.4 with visit counts.
 
 **Learning-rate schedules**
 - optax schedules count optimiser updates, not environment steps. A 1M-step run has only about 68k updates, so `transition_steps=total_timesteps` barely decays the learning rate.

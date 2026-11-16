@@ -1,8 +1,6 @@
 """Atari wrappers from https://github.com/DLR-RM/stable-baselines3/blob/master/stable_baselines3/common/atari_wrappers.py"""
 
-from typing import Dict, SupportsFloat
-
-from typing import Any, Tuple
+from typing import Any, SupportsFloat
 
 import gymnasium as gym
 import numpy as np
@@ -17,8 +15,8 @@ except ImportError:
 
 
 
-AtariResetReturn = Tuple[np.ndarray, Dict[str, Any]]
-AtariStepReturn = Tuple[np.ndarray, SupportsFloat, bool, bool, Dict[str, Any]]
+AtariResetReturn = tuple[np.ndarray, dict[str, Any]]
+AtariStepReturn = tuple[np.ndarray, SupportsFloat, bool, bool, dict[str, Any]]
 
 
 class StickyActionEnv(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
@@ -71,7 +69,7 @@ class NoopResetEnv(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
             noops = self.unwrapped.np_random.integers(1, self.noop_max + 1)
         assert noops > 0
         obs = np.zeros(0)
-        info: Dict = {}
+        info: dict = {}
         for _ in range(noops):
             obs, _, terminated, truncated, info = self.env.step(self.noop_action)
             if terminated or truncated:

@@ -1,11 +1,9 @@
 from copy import copy
-from typing import List, Tuple
 
 import gymnasium as gym
 
 from envs.base import VecEnv, VecEnvWrapper
 from envs.state import State
-
 
 
 class RecordScores(gym.Wrapper):
@@ -50,7 +48,7 @@ class Evaluator(VecEnvWrapper):
         self.episode_lengths = []
 
 
-    def step_wait(self) -> Tuple[State, List]:
+    def step_wait(self) -> tuple[State, list]:
         """
         Apply sequence of actions to sequence of environments
         actions -> (observations, rewards, dones)
@@ -64,7 +62,7 @@ class Evaluator(VecEnvWrapper):
                 self.episode_lengths.append(info['episode_length'])
         return env_state
 
-    def evaluate(self) -> Tuple[List, List]:
+    def evaluate(self) -> tuple[list, list]:
         """Report recorded metrics and reset them internally."""
         returns = copy(self.returns)
         episode_lengths = copy(self.episode_lengths)

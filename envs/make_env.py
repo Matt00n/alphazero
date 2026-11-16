@@ -1,22 +1,21 @@
-from typing import Any, List, Optional, Union
+from typing import Any
 
 import gymnasium as gym
 
-from envs.atari_wrappers import ( 
+from envs.atari_wrappers import (
     ClipRewardEnv,
     EpisodicLifeEnv,
     FireResetEnv,
     MaxAndSkipEnv,
     NoopResetEnv,
 )
-from envs.batched_env import SequencedBatchedEnv, ParallelBatchedEnv
-from envs.evaluate import RecordScores, Evaluator
+from envs.batched_env import ParallelBatchedEnv, SequencedBatchedEnv
+from envs.evaluate import Evaluator, RecordScores
 from envs.normalize import VecNormalize
 
 
-
 def make_env(
-    env_id: Union[str, Any],
+    env_id: str | Any,
     num_envs: int,
     parallel: bool = True,
     clip_actions: bool = False,
@@ -26,11 +25,11 @@ def make_env(
     clip_rewards: float = 10.,
     gamma: float = 0.99,
     epsilon: float = 1e-8,
-    norm_obs_keys: Optional[List[str]] = None,
+    norm_obs_keys: list[str] | None = None,
     evaluate: bool = False,
     is_atari: bool = False,
     capture_video: bool = False
-) -> Union[SequencedBatchedEnv, ParallelBatchedEnv]:
+) -> SequencedBatchedEnv | ParallelBatchedEnv:
     
     # TODO seed env
     # TODO handle atari

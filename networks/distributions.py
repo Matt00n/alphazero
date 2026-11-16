@@ -1,6 +1,7 @@
 """Probability distributions in JAX."""
 
 import abc
+
 import jax
 import jax.numpy as jnp
 import tensorflow_probability.substrates.jax.distributions as tfd
@@ -31,7 +32,6 @@ class ParametricDistribution(abc.ABC):
     @abc.abstractmethod
     def create_dist(self, parameters):
         """Creates distribution from parameters."""
-        pass
 
     @property
     def param_size(self):

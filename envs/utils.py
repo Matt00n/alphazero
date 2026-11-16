@@ -1,12 +1,11 @@
-from collections import OrderedDict
-from typing import Any, Dict, List, Tuple
 import warnings
+from collections import OrderedDict
+from typing import Any
 
-from gymnasium import spaces
 import numpy as np
+from gymnasium import spaces
 
 from envs.base import VecEnvObs
-
 
 
 def check_shape_equal(space1: spaces.Space, space2: spaces.Space) -> None:
@@ -21,7 +20,7 @@ def check_shape_equal(space1: spaces.Space, space2: spaces.Space) -> None:
     if isinstance(space1, spaces.Dict):
         assert isinstance(space2, spaces.Dict), "spaces must be of the same type"
         assert space1.spaces.keys() == space2.spaces.keys(), "spaces must have the same keys"
-        for key in space1.spaces.keys():
+        for key in space1.spaces:
             check_shape_equal(space1.spaces[key], space2.spaces[key])
     elif isinstance(space1, spaces.Box):
         assert space1.shape == space2.shape, "spaces must have the same shape"
@@ -43,7 +42,7 @@ def check_for_nested_spaces(obs_space: spaces.Space) -> None:
                 )
 
 
-def copy_obs_dict(obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+def copy_obs_dict(obs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """
     Deep-copy a dict of numpy arrays.
 
@@ -54,7 +53,7 @@ def copy_obs_dict(obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     return OrderedDict([(k, np.copy(v)) for k, v in obs.items()])
 
 
-def dict_to_obs(obs_space: spaces.Space, obs_dict: Dict[Any, np.ndarray]) -> VecEnvObs:
+def dict_to_obs(obs_space: spaces.Space, obs_dict: dict[Any, np.ndarray]) -> VecEnvObs:
     """
     Convert an internal representation raw_obs into the appropriate type
     specified by space.
@@ -75,7 +74,7 @@ def dict_to_obs(obs_space: spaces.Space, obs_dict: Dict[Any, np.ndarray]) -> Vec
         return obs_dict[None]
 
 
-def obs_space_info(obs_space: spaces.Space) -> Tuple[List[str], Dict[Any, Tuple[int, ...]], Dict[Any, np.dtype]]:
+def obs_space_info(obs_space: spaces.Space) -> tuple[list[str], dict[Any, tuple[int, ...]], dict[Any, np.dtype]]:
     """
     Get dict-structured information about a gym.Space.
 
