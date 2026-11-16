@@ -69,7 +69,7 @@ from networks.policy import BaseDynamicsFn, BaseRepresentationFn, ForwardPass, P
 class Config:
     # experiment
     experiment_name = "base_short"
-    seed = 22
+    seed = 23
     platform = "cpu"  # CPU or GPU
     capture_video = False
     write_logs_to_file = False
@@ -104,7 +104,7 @@ class Config:
 
     # quantile regression
     num_atoms: int = (
-        1  # 8 # NOTE: num_atoms = 1 yields non-distributional RL with MSE loss
+        8  # 8 # NOTE: num_atoms = 1 yields non-distributional RL with MSE loss
     )
     # ### QR VALUE HEAD (search "QR VALUE HEAD"): num_atoms > 1 with
     # ### categorical_value = False -> quantile-regression value head with
@@ -115,7 +115,7 @@ class Config:
     # False: scalar value head trained with MSE (as in alphazero.py).
     # True:  601-atom categorical value head with h-transform + cross-entropy
     #        (MuZero Appendix F), i.e. the previous behaviour.
-    categorical_value: bool = True
+    categorical_value: bool = False
     # ### CATEGORICAL SUPPORT (search "CATEGORICAL SUPPORT"): range (+-max in
     # ### h-space) and atom spacing of the categorical value / reward supports.
     # ### None -> MuZero's Atari support: 601 integer atoms (+-300, step 1).
@@ -2280,12 +2280,14 @@ def compute_muzero_loss(
 
     # jax.debug.print('targets: {x}', x=targets)
 
-    _, (policy_loss, v_loss, dynamics_loss, consistency_loss, value_error) = jax.lax.scan(
-        unroll_loss,
-        # ### BOTTOM-UP STEP 2b: first dynamics call (on representation output) unscaled
-        (hidden, jnp.ones((), dtype=hidden.dtype)),
-        targets,
-        length=num_unroll_steps,
+    _, (policy_loss, v_loss, dynamics_loss, consistency_loss, value_error) = (
+        jax.lax.scan(
+            unroll_loss,
+            # ### BOTTOM-UP STEP 2b: first dynamics call (on representation output) unscaled
+            (hidden, jnp.ones((), dtype=hidden.dtype)),
+            targets,
+            length=num_unroll_steps,
+        )
     )
     # ### END BOTTOM-UP STEP 2b ##################################################
 

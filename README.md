@@ -15,24 +15,101 @@ This is a reimplementation of the infamous [AlphaZero](https://arxiv.org/abs/171
 
 ### Potential future extensions (if I have time...)
 
-* Extension to [MuZero](https://arxiv.org/abs/1911.08265) by learning dynamics model. *This is work in progress and not fully functional yet!*.
+* Consolidating the working [MuZero](https://arxiv.org/abs/1911.08265) (currently `muzero_ablate.py`, see below) into `muzero.py`.
 * Finishing REANALYZE.
 * Enable choosing MCTS version (standard, sampled, Gumbel, stochastic) via Config (has to be manually changed currently).
 * Support for continuous action spaces
 
 
-## What it took, start to finish
+## MuZero
+
+The working MuZero currently lives in `muzero_ablate.py`. It will be consolidated into `muzero.py`. Every change relative to the original code is flagged with a `### TAG` comment, so `grep "### "` lists them.
+
+### Results on Acrobot-v1
+
+Single seed (22), 1M environment steps. Evaluation uses the most-visited root action, without Dirichlet noise (`eval_visits/*`).
+
+| Setup | Final return (last evaluations) |
+|---|---|
+| AlphaZero (`alphazero.py`, true environment in search) | −61.5 … −61.9 (spread 0.6–0.9) |
+| **MuZero, quantile value head (8 quantiles), 50 simulations** | **−60.5 ± 0.6** |
+| MuZero, scalar value head (MSE), 50 simulations | −62.3 ± 1.2 |
+| MuZero, scalar head, consistency loss 2.0, 100 simulations, 2M steps | −60.75 ± 1.1 |
+| MuZero, categorical head in raw space (81 atoms) | −64.3 ± 3.3 |
+| MuZero, MuZero's categorical h-space head (81 / 201 / 601 atoms) | unstable, −70 … −500 |
+
+The optimum is around −60. A second seed for the quantile head is pending.
+
+### Recommended settings
+
+These are the current defaults in `muzero_ablate.py`, unless the table says otherwise.
+
+| Group | Setting | Value | Note |
+|---|---|---|---|
+| Value head | `categorical_value`, `num_atoms`, `qr_kappa` | `False`, `8`, `1.0` | Quantile regression on raw returns: no transform bias, no binning. `num_atoms=1` gives a scalar MSE head. |
+| Reward head | `reward_support_max` | `None` | MuZero's 601-atom categorical reward head. |
+| Value targets | `use_gae`, `gae_lambda`, `n_step_gamma` | `True`, `0.95`, `0.99` | GAE over the *stored* MCTS search values, as in AlphaZero. Do not bootstrap from the online network at loss time. |
+| Model | `learned_representation`, `learned_dynamics_search` | `True`, `True` | Full MuZero. Set either to `False` for oracle ablations. |
+| Unrolled loss | `loss_unroll_length` | `5` | |
+| Unrolled loss | `dynamics_gradient_scale` | `0.5` | MuZero's gradient scaling at the dynamics input. |
+| Unrolled loss | `muzero_loss_weighting` | `True` | Weight 1 at k=0 and 1/K for each k≥1. |
+| Unrolled loss | `consistency_loss_coef` | `0.0` | Not in the original MuZero. 2.0 (EfficientZero) helped the scalar head bootstrap before reward-aware PER existed. |
+| Search | `num_simulations` | `50` | 100 is slightly better and twice as slow. |
+| Search | Dirichlet α, fraction; `pb_c_init`, `pb_c_base` | 0.3, 0.25; 1.25, 19652 | MuZero's values. |
+| Replay | `max_replay_size`, `min_replay_size`, `replay_buffer_batch_size` | 32768, 8192, 128 | 8192 was too small. A batch of 256 made no difference. |
+| Replay | `per_alpha`, `per_beta_anneal` (0.4 → 1.0), `per_epsilon` | 0.6, `True`, 1e-6 | EfficientZero's values. |
+| Replay | `per_reward_priority_weight` | `1.0` | Priority = value error + reward error. This is what lets the agent bootstrap from rare goal transitions. |
+| Optimiser | `learning_rate`, `late_lr_decay`, `lr_decay_start_frac` | 1e-3, `True`, 0.8 | Constant, then linear decay to 1% over the last 20% of updates. |
+| Optimiser | `max_grad_norm` | `50` | Effectively a safety net. 0.5 clipped almost every update. |
+| Optimiser | `l2_coef`, `l2_exclude_bias_and_norm` | 1e-4, `True` | L2 on kernels only. L2 on LayerNorm gains collapsed the representation. |
+| Networks | embedding; representation, dynamics, value, policy layers | 64; 64×2, 64×2, 256×5, 32×4 (swish) | Larger networks bootstrapped much later. |
+| Data | `num_envs`, `unroll_length`, `total_timesteps` | 16, 128, 1e6 | |
+| Evaluation | `dual_eval_visit_counts` | `True` | Report `eval_visits/*` (most-visited action, no noise). `eval/*` is argmax-Q with noise. |
+
+### Notes on tuning
+
+**Running experiments**
+- Runs are deterministic for a given seed and config. Compare variants on the same seed.
+- `eval_every` changes the epoch structure and the random streams, so keep it fixed when comparing.
+- Judge stability on `eval_visits/*`. Root Dirichlet noise in the `eval/*` evaluator makes good agents look unstable: one run read −74.8 ± 56 there and −62.5 ± 1.4 on `eval_visits/*`.
+
+**Learning-rate schedules**
+- optax schedules count optimiser updates, not environment steps. A 1M-step run has only about 68k updates, so `transition_steps=total_timesteps` barely decays the learning rate.
+- Annealing all the way down can freeze a suboptimal strategy. On Acrobot there are two attractors, around −62 and −83. Decay late instead (`late_lr_decay`).
+
+**Value heads**
+- MuZero's h-space categorical head estimates h⁻¹(E[h(G)]). Under noisy targets this is biased towards smaller |V| (Jensen's inequality), and more atoms do not remove the bias.
+- On returns of order 100, prefer the quantile head, the scalar head, or the raw-space two-hot (`value_raw_space_twohot`).
+- `value_abs_err_k0` tracks how accurate the decoded values are.
+
+**Bootstrapping from rare rewards**
+- Under random play there is about one goal per 20k steps. If the reward loss sits at its cross-entropy floor and `goal*` metrics stay near zero, the model has not seen the goal yet.
+- Reward-aware PER fixes this. Larger networks and larger buffers make it worse.
+
+**Representation collapse**
+- Watch the collapse metrics: pairwise cosine, feature std and LayerNorm gain.
+- Watch the gradient norms and `grad_clip_frac`.
+
+**Model vs. planning**
+- `planning_diagnostics=True` compares the learned-model search with a true-environment search from the same states. It reports agreement, regret, Q errors and value drift for k = 1…8, and roughly doubles evaluation time.
+- A longer unroll (9) made the model more accurate but the agent worse. With a 64-dim embedding, the extra model accuracy cost policy and value quality.
+
+**Time limits**
+- Truncation must not be treated as termination. Time-limit steps are bootstrapped in GAE, and unroll steps after a truncation are masked rather than made absorbing.
+- The n-step path (`use_gae=False`) still treats truncation as terminal.
+
+### What it took, start to finish
 
 **Bugs fixed:**
 1. **Value targets** were bootstrapped from the current network at loss time. They now use stored GAE over the MCTS search values.
 2. **Prioritised replay read and wrote the wrong columns** of `MuZeroTransition`: goal transitions were never sampled, and `terminal_mask` was overwritten.
 3. **Truncation was treated as termination,** both in value targets and in the model's absorbing states.
-4. **Smaller fixes:** the n-step padding, the categorical decoding, PER importance weights, and the learning-rate schedule counting updates rather than environment steps.
+4. **Smaller fixes:** the n-step padding, the categorical decoding, PER importance weights (now normalised per batch), and the learning-rate schedule counting updates rather than environment steps.
 
 **Changes that made the difference:**
-- **Scalar value head** instead of 601 atoms.
+- **Scalar, and later quantile, value head** instead of 601 atoms.
 - **MuZero's gradient scaling and per-step loss weights.**
-- **Consistency loss 2.0** (from EfficientZero, not original MuZero).
+- **Reward-aware PER** (or, before that, consistency loss 2.0).
 - **50 simulations.**
 - **Buffer 32768.**
 - **Gradient clip at 50, and no L2 on biases or LayerNorm.**
