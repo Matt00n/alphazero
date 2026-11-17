@@ -11,11 +11,10 @@ This is a reimplementation of the infamous [AlphaZero](https://arxiv.org/abs/171
 * Option for using a distributional value function via [Quantile Regression](https://arxiv.org/abs/1710.10044) similarly as in [AlphaTensor](https://www.nature.com/articles/s41586-022-05172-4).
 * Option for using [GAE (Generalized Advantage Estimation)](https://arxiv.org/abs/1506.02438) instead of n-step returns.
 * Environment support for [gymnax](https://github.com/RobertTLange/gymnax). Minimal modification of the environments is required, this has been done for CartPole, MountainCar and Acrobot so far. Other common JAX environment libraries can also be plugged in with small adaptations.
-* Option for [REANALYZE](https://arxiv.org/abs/2104.06294). *This is work in progress and not fully implemented yet!*.
+* Option for [MuZero Reanalyze](https://arxiv.org/abs/2104.06294) in `muzero.py` (`Config.reanalyze`): stored trajectories are searched again with the current networks and their targets are refreshed in the replay buffer. On Acrobot it gave no consistent gain (see below).
 
 ### Potential future extensions (if I have time...)
 
-* Finishing REANALYZE.
 * Enable choosing MCTS version (standard, sampled, Gumbel, stochastic) via Config (has to be manually changed currently).
 * Support for continuous action spaces
 
@@ -26,18 +25,20 @@ The working [MuZero](https://arxiv.org/abs/1911.08265) is `muzero.py`. It was co
 
 ### Results on Acrobot-v1
 
-Single seed (22), 1M environment steps. Evaluation uses the most-visited root action, without Dirichlet noise (`eval/*` in `muzero.py`, `eval_visits/*` in `muzero_ablate.py`).
+Seed 22 unless noted, 1M environment steps. Evaluation uses the most-visited root action, without Dirichlet noise (`eval/*` in `muzero.py`, `eval_visits/*` in `muzero_ablate.py`).
 
 | Setup | Final return (last evaluations) |
 |---|---|
 | AlphaZero (`alphazero.py`, true environment in search) | −61.5 … −61.9 (spread 0.6–0.9) |
-| **MuZero, quantile value head (8 quantiles), 50 simulations** | **−60.5 ± 0.6** |
-| MuZero, scalar value head (MSE), 50 simulations | −62.3 ± 1.2 |
+| **MuZero, scalar value head (MSE), 50 simulations (default)** | **−62.3 ± 1.2; seed 23: −62.1 ± 0.4** |
+| MuZero, scalar head + reanalyze | −63.0 ± 2.1 |
+| MuZero, quantile value head (8 quantiles), 50 simulations | −60.5 ± 0.6; seed 23: −82.7 ± 1.7 |
+| MuZero, quantile head + reanalyze | −82.2 ± 2.5; seed 23: −61.0 ± 0.4 |
 | MuZero, scalar head, consistency loss 2.0, 100 simulations, 2M steps | −60.75 ± 1.1 |
 | MuZero, categorical head in raw space (81 atoms) | −64.3 ± 3.3 |
 | MuZero, MuZero's categorical h-space head (81 / 201 / 601 atoms) | unstable, −70 … −500 |
 
-The optimum is around −60. A second seed for the quantile head is pending.
+The optimum is around −60. Runs end on one of two strategies, about −62 or about −83 (one extra swing). The scalar head reached −62 in all three of its runs. The quantile head gave the best single run but ended at −83 in two of four. Reanalyze flipped the quantile head's outcome on both seeds, in opposite directions, so the choice of strategy looks like chance per run rather than an effect of either option.
 
 ### Recommended settings
 
@@ -45,7 +46,7 @@ These are the defaults in `muzero.py`, unless the table says otherwise.
 
 | Group | Setting | Value | Note |
 |---|---|---|---|
-| Value head | `categorical_value`, `num_atoms`, `qr_kappa` | `False`, `8`, `1.0` | Quantile regression on raw returns: no transform bias, no binning. `num_atoms=1` gives a scalar MSE head. |
+| Value head | `categorical_value`, `num_atoms`, `qr_kappa` | `False`, `1`, `1.0` | Scalar MSE head on raw returns: no transform bias, no binning. `num_atoms=8` gives the quantile head: best single run, less robust. |
 | Reward head | `reward_support_max` | `None` | MuZero's 601-atom categorical reward head. |
 | Value targets | `use_gae`, `gae_lambda`, `n_step_gamma` | `True`, `0.95`, `0.99` | GAE over the *stored* MCTS search values, as in AlphaZero. Do not bootstrap from the online network at loss time. |
 | Model | `learned_dynamics_search` | `True` | Full MuZero. `False` runs the search on the true environment (oracle ablation). |
@@ -63,7 +64,22 @@ These are the defaults in `muzero.py`, unless the table says otherwise.
 | Optimiser | `l2_coef` | 1e-4 | L2 on kernels only. L2 on LayerNorm gains collapsed the representation. |
 | Networks | embedding; representation, dynamics, value, policy layers | 64; 64×2, 64×2, 256×5, 32×4 (swish) | Larger networks bootstrapped much later. |
 | Data | `num_envs`, `unroll_length`, `total_timesteps` | 16, 128, 1e6 | |
+| Reanalyze | `reanalyze`, `reanalyze_windows_per_step` | `False`, 1 | No consistent gain on Acrobot, 1.3–1.9× training time (see below). |
 | Evaluation | `eval_argmax_q` | `False` | `eval/*` uses the most-visited action without noise. `True` adds an argmax-Q evaluator with noise (`eval_argmax_q/*`). |
+
+### Reanalyze
+
+With `reanalyze=True`, every training step draws `reanalyze_windows_per_step` random windows of stored transitions from the replay buffer. A window is `unroll_length × num_envs` consecutive steps, the same size as one acting unroll. Each window is searched again with the current networks, with root noise as when acting (`reanalyze_dirichlet_fraction`). Its policy targets, search values (and so its GAE value targets), unroll targets and replay priorities are then recomputed exactly as for fresh data, and written back.
+
+- **Why this works:** the buffer holds one continuous, time-major stream of the environments. Any aligned window is a block of consecutive transitions, and the rows right after it are the states to bootstrap from. No environment state has to be stored, because the search only needs observations.
+- **Cost:** each window costs as much search as one acting unroll, so one window per step roughly doubles search time.
+- **Requirements:** `learned_dynamics_search=True`, `num_resets_per_eval=0`, and a buffer size that is a multiple of `num_envs`.
+- **Metrics:**
+  - `reanalyze_policy_tv`: total variation between the new and the stored policy targets.
+  - `reanalyze_value_target_change`: mean absolute change of the k=0 value targets.
+  - `reanalyze_window_age`: how many training steps ago the window was collected.
+- **Results on Acrobot (1 window per step):** no consistent effect on the final return (see the table above). Goals were found and the policy bootstrapped later, by about 100k–250k steps, and training took 1.3–1.9× as long. The policy targets change a lot early on (`reanalyze_policy_tv` about 0.2–0.3) and little by the end (about 0.07). Acrobot is cheap to simulate, so fresh data is a better use of the compute here. Reanalyze is meant for settings where environment steps are expensive.
+- **Differences from the paper:** value targets stay GAE over search values, not n-step returns from a target network. There is no separate fraction of reanalysed targets: refreshed windows simply replace their old targets in the buffer.
 
 ### Notes on tuning
 
@@ -78,8 +94,9 @@ These are the defaults in `muzero.py`, unless the table says otherwise.
 
 **Value heads**
 - MuZero's h-space categorical head estimates h⁻¹(E[h(G)]). Under noisy targets this is biased towards smaller |V| (Jensen's inequality), and more atoms do not remove the bias.
-- On returns of order 100, prefer the quantile head, the scalar head, or the raw-space two-hot (`value_raw_space_twohot`).
+- On returns of order 100, prefer the scalar head, the quantile head, or the raw-space two-hot (`value_raw_space_twohot`).
 - `value_abs_err_k0` tracks how accurate the decoded values are.
+- For the quantile head, keep `qr_kappa=1`. κ=10 was worse on both seeds: −61.6 instead of −60.5 on seed 22, and −94 instead of −83 on seed 23. Its value error was higher throughout.
 
 **Bootstrapping from rare rewards**
 - Under random play there is about one goal per 20k steps. If the reward loss sits at its cross-entropy floor and `goal*` metrics stay near zero, the model has not seen the goal yet.

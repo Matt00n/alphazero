@@ -168,6 +168,26 @@ class QueueBase(ReplayBuffer[ReplayBufferState, Sample], Generic[Sample]):
     def set_priorities(self, buffer_state: ReplayBufferState, priorities: jnp.ndarray):
         return buffer_state
 
+    # ### REANALYZE: direct access to stored rows (rows keep their insertion
+    # ### order; `start` may be traced, no bounds check: start + num_rows must
+    # ### not exceed max_replay_size).
+    def read_rows(
+        self, buffer_state: ReplayBufferState, start: jnp.ndarray, num_rows: int
+    ) -> Sample:
+        """Returns the unflattened rows [start, start + num_rows)."""
+        rows = jax.lax.dynamic_slice_in_dim(buffer_state.data, start, num_rows, axis=0)
+        return self._unflatten_fn(rows)
+
+    def write_rows(
+        self, buffer_state: ReplayBufferState, start: jnp.ndarray, samples: Sample
+    ) -> ReplayBufferState:
+        """Overwrites the rows [start, start + len(samples)) in place."""
+        update = self._flatten_fn(samples).astype(self._data_dtype)
+        data = jax.lax.dynamic_update_slice_in_dim(
+            buffer_state.data, update, start, axis=0
+        )
+        return buffer_state.replace(data=data)
+
 
 class Queue(QueueBase[Sample], Generic[Sample]):
     """Implements a limited-size queue replay buffer."""

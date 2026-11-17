@@ -94,10 +94,13 @@ class Config:
     #   categorical_value = False, num_atoms = 1  -> scalar head, MSE loss
     #   categorical_value = False, num_atoms > 1  -> quantile-regression head with
     #       num_atoms quantiles, quantile Huber loss (kappa = qr_kappa), as in
-    #       AlphaTensor. The search uses the quantile mean. Best on Acrobot.
+    #       AlphaTensor. The search uses the quantile mean. Best single run on
+    #       Acrobot (-60.5), but ended on the -83 strategy in 2 of 4 runs.
     #   categorical_value = True                  -> categorical head, two-hot
     #       cross-entropy over the support below (MuZero Appendix F).
-    num_atoms: int = 8
+    # CHANGED 2026-11-17: default 8 (QR) -> 1 (scalar). The scalar head reached the
+    # -62 strategy in 3 of 3 runs (seeds 22, 23, seed 22 + reanalyze), QR in 2 of 4.
+    num_atoms: int = 1
     qr_kappa: float = 1.0
     categorical_value: bool = False
     # categorical supports: range (+-max, in h-space) and atom spacing.
@@ -134,8 +137,17 @@ class Config:
     # Eval only, roughly doubles eval time.
     planning_diagnostics: bool = False
 
-    # reanalyze
+    # reanalyze (MuZero Reanalyze, adapted to the stored GAE targets): each
+    # training step, reanalyze_windows_per_step random windows of stored
+    # consecutive transitions (unroll_length x num_envs, like one acting unroll)
+    # are searched again with the current networks; their policy targets, search
+    # values (-> GAE value targets), unroll targets and replay priorities are
+    # recomputed and written back into the buffer. Each window costs as much
+    # search as one acting unroll. Requires learned_dynamics_search and
+    # num_resets_per_eval = 0 (continuous trajectories in the buffer).
     reanalyze: bool = False
+    reanalyze_windows_per_step: int = 1
+    reanalyze_dirichlet_fraction: float = 0.25  # root noise, as when acting
 
     # replay buffer
     min_replay_size: int = 8192
@@ -1065,44 +1077,307 @@ class PlanningDiagnostics:
 
 
 
+# Targets and priorities for stored trajectories, shared by acting, the replay
+# prefill and reanalyze.
+def value_target_fn() -> Callable:
+    """GAE(lambda) or n-step value targets over stored search values (Config)."""
+    if Config.use_gae:
+        return partial(
+            compute_gae, lambda_=Config.gae_lambda, discount=Config.n_step_gamma
+        )
+    return partial(
+        n_step_bootstrapped_targets, n=Config.n_step_n, gamma=Config.n_step_gamma
+    )
 
-def reanalyze(
+
+def replay_priorities(
+    targets: jnp.ndarray,
+    predicted_values: jnp.ndarray,
     data: MuZeroTransition,
+    representation_fn: BaseRepresentationFn,
+    dynamics_fn: BaseDynamicsFn,
+) -> jnp.ndarray:
+    """(|value error| + w * |one-step reward error| + eps) ** alpha (reward-aware PER)."""
+    return (
+        jnp.mean(jnp.abs(targets - predicted_values), axis=-1)
+        + Config.per_reward_priority_weight
+        * reward_prediction_error(
+            representation_fn,
+            dynamics_fn,
+            data.observation,
+            data.action,
+            data.reward,
+        )
+        + Config.per_epsilon
+    ) ** Config.per_alpha
+
+
+def process_unroll(
+    data: MuZeroTransition,
+    bootstrap_search_value: jnp.ndarray,
+    representation_fn: BaseRepresentationFn,
+    dynamics_fn: BaseDynamicsFn,
+) -> tuple[MuZeroTransition, jnp.ndarray, jnp.ndarray]:
+    """Value targets, replay priorities and unroll targets for a trajectory block
+    [T, B, ...] of consecutive transitions. Requires data.search_value (root
+    search values) and data.bootstrap_value (prior values, used for the
+    priorities); bootstrap_search_value [B, ...] is the root search value at the
+    state following the block. Returns (data, termination, truncation)."""
+    # split done into real termination and truncation (time limit)
+    termination, truncation = split_termination_truncation(
+        data.discount, data.extras["state_extras"]["truncation"]
+    )
+
+    (
+        value_prefix_targets,
+        bootstrap_observations,
+        bootstrap_values,
+        bootstrap_discounts,
+    ) = value_target_fn()(
+        rewards=data.reward,
+        discounts=data.discount * (1 - data.extras["state_extras"]["truncation"]),
+        # GAE sees truncation separately and only cuts the lambda-chain there
+        termination_discount=1.0 - termination,
+        observations=data.next_observation,
+        values=jnp.concatenate([data.search_value, jnp.array([bootstrap_search_value])]),
+    )
+
+    # NOTE: data.bootstap_value is overloaded with the prior values
+    targets = (
+        jnp.expand_dims(value_prefix_targets, -1)
+        + jnp.expand_dims(bootstrap_discounts, -1) * bootstrap_values
+    )
+    priorities = replay_priorities(
+        targets, data.bootstrap_value, data, representation_fn, dynamics_fn
+    )
+
+    data = data._replace(
+        value_prefix_target=value_prefix_targets,
+        bootstrap_observation=bootstrap_observations,
+        bootstrap_value=bootstrap_values,
+        bootstrap_discount=bootstrap_discounts,
+        priority=priorities,
+    )
+
+    # calculate targets per step for unrolling loss function
+    targets = (
+        data.observation,
+        data.target_policy_probs,
+        data.value_prefix_target,
+        data.bootstrap_discount,
+        data.bootstrap_value,
+        data.bootstrap_observation,
+        data.reward,
+        data.action,
+    )
+    (
+        unroll_obs,
+        policy_targets,
+        value_prefix_targets,
+        bootstrap_discounts,
+        bootstrap_values,
+        bootstrap_observations,
+        reward_targets,
+        unroll_actions,
+        unroll_mask,
+        terminal_mask,
+    ) = collect_targets(
+        targets,
+        termination,  # real termination only (absorbing states)
+        Config.loss_unroll_length,
+        truncation=truncation,
+    )
+
+    data = data._replace(
+        unroll_obs=unroll_obs,
+        policy_targets=policy_targets,
+        value_prefix_targets=value_prefix_targets,
+        bootstrap_discounts=bootstrap_discounts,
+        bootstrap_values=bootstrap_values,
+        bootstrap_observations=bootstrap_observations,
+        reward_targets=reward_targets,
+        unroll_actions=unroll_actions,
+        unroll_mask=unroll_mask,
+        terminal_mask=terminal_mask,
+    )
+    return data, termination, truncation
+
+
+# ### REANALYZE (Config.reanalyze), MuZero Reanalyze adapted to the stored GAE
+# ### targets. The replay buffer holds one continuous time-major stream of the
+# ### (per-device) envs: every insert (prefill, acting unrolls) and every FIFO
+# ### roll moves a multiple of num_envs rows, and the actor continues from the
+# ### last state of the previous unroll (requires num_resets_per_eval = 0).
+# ### Hence rows [start, start + T * B) with start % B == 0 are a block [T, B]
+# ### of consecutive transitions, and rows [start + T * B, start + (T + 1) * B)
+# ### hold the states following the block (bootstrap). Reanalyzing a window
+# ### re-runs the learned-model search on the stored observations with the
+# ### current networks (no env state needed) and recomputes the policy targets,
+# ### search values -> GAE value targets, unroll targets and priorities exactly
+# ### like for freshly collected data (process_unroll), then writes them back.
+def model_search(
+    observations: jnp.ndarray,
+    key: jnp.ndarray,
     forward: ForwardPass,
     representation_fn: BaseRepresentationFn,
     dynamics_fn: BaseDynamicsFn,
-    env: GymnaxToBraxWrapper,
-    rollout_env: Any,
-    key: jnp.ndarray,
-) -> MuZeroTransition:
-    data = jax.tree_util.tree_map(
-        lambda x: jnp.reshape(x, (Config.num_minibatches, -1) + x.shape[1:]), data
+    dirichlet_fraction: float,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Learned-model search from observations with the same rng use as actor_step.
+
+    Returns (search policy, root search value, prior value)."""
+    _, _logits_rng, search_rng = jax.random.split(key, 3)
+    root_embedding = representation_fn(observations)
+    prior_logits, value = forward(root_embedding)
+    policy_output = run_search(
+        None,
+        root_embedding,
+        prior_logits,
+        value,
+        forward,
+        representation_fn,
+        dynamics_fn,
+        None,
+        search_rng,
+        use_learned_model=True,
+        dirichlet_fraction=dirichlet_fraction,
+    )
+    return (
+        policy_output.action_weights,
+        policy_output.search_tree.summary().value,
+        value,
     )
 
-    def f(carry_key, data: MuZeroTransition):
-        new_key, key = jax.random.split(carry_key)
-        # TODO: env_state currently not saved! needs to be saved or restored from other data!
-        env_state = data.env_state
-        _, reanalyzed_data = actor_step(
-            env, rollout_env, env_state, forward, representation_fn, dynamics_fn, key
+
+def reanalyze_window(
+    replay_buffer: replay_buffers.QueueBase,
+    buffer_state: ReplayBufferState,
+    start: jnp.ndarray,
+    forward: ForwardPass,
+    representation_fn: BaseRepresentationFn,
+    dynamics_fn: BaseDynamicsFn,
+    unroll_key: jnp.ndarray,
+    bootstrap_key: jnp.ndarray,
+    unroll_length: int,
+    num_envs: int,
+    dirichlet_fraction: float,
+) -> tuple[ReplayBufferState, Metrics]:
+    """Reanalyzes the stored rows [start, start + unroll_length * num_envs).
+
+    The rng use mirrors acting (generate_unroll with unroll_key, bootstrap
+    actor_step with bootstrap_key): with the acting params and keys, the stored
+    rows of an acting unroll are reproduced exactly."""
+    window_size = unroll_length * num_envs
+    rows = replay_buffer.read_rows(buffer_state, start, window_size + num_envs)
+    old = jax.tree_util.tree_map(
+        lambda x: jnp.reshape(x[:window_size], (unroll_length, num_envs) + x.shape[1:]),
+        rows,
+    )
+    bootstrap_observations = rows.observation[window_size:]
+
+    def search_step(current_key, observations):
+        current_key, next_key = jax.random.split(current_key)
+        return next_key, model_search(
+            observations,
+            current_key,
+            forward,
+            representation_fn,
+            dynamics_fn,
+            dirichlet_fraction,
         )
 
-        return new_key, reanalyzed_data
-
-    _, reanalyzed_data = jax.lax.scan(f, key, data, length=Config.num_minibatches)
-
-    chex.assert_equal_shape(
-        data.target_policy_probs, reanalyzed_data.target_policy_probs
+    _, (policy, search_value, prior_value) = jax.lax.scan(
+        search_step, unroll_key, old.observation
     )
-    chex.assert_equal_shape(data.bootstrap_value, reanalyzed_data.bootstrap_value)
-
-    data = data._replace(
-        target_policy_probs=reanalyzed_data.target_policy_probs,
-        bootstrap_value=reanalyzed_data.bootstrap_value,
+    _, bootstrap_search_value, _ = model_search(
+        bootstrap_observations,
+        bootstrap_key,
+        forward,
+        representation_fn,
+        dynamics_fn,
+        dirichlet_fraction,
     )
+    data = old._replace(
+        target_policy_probs=policy,
+        search_value=search_value,
+        bootstrap_value=prior_value,  # prior values (overloaded, see actor_step)
+    )
+    data, _, _ = process_unroll(
+        data, bootstrap_search_value, representation_fn, dynamics_fn
+    )
+
+    def k0_value_target(d):
+        return jnp.mean(
+            jnp.expand_dims(d.value_prefix_target, -1)
+            + jnp.expand_dims(d.bootstrap_discount, -1) * d.bootstrap_value,
+            axis=-1,
+        )
+
+    # continuity check of the stored stream: for non-terminal steps, the next
+    # observation stored with row t must be the observation of row t + 1 (the
+    # bootstrap rows for the last step); exactly 0 if the window is a block of
+    # consecutive transitions
+    following_obs = jnp.concatenate(
+        [old.observation[1:], bootstrap_observations[None]], axis=0
+    )
+    obs_mismatch = jnp.any(
+        following_obs != old.next_observation,
+        axis=tuple(range(2, following_obs.ndim)),
+    )
+    not_done = old.discount  # discount = 1 - done (termination or truncation)
+    metrics = {
+        "reanalyze_stream_mismatch": jnp.sum(obs_mismatch * not_done)
+        / jnp.maximum(jnp.sum(not_done), 1.0),
+        # total variation between the new and the stored policy targets
+        "reanalyze_policy_tv": jnp.mean(
+            0.5 * jnp.sum(jnp.abs(policy - old.target_policy_probs), axis=-1)
+        ),
+        "reanalyze_value_target_change": jnp.mean(
+            jnp.abs(k0_value_target(data) - k0_value_target(old))
+        ),
+        # in acting unrolls (training steps) before the newest data
+        "reanalyze_window_age": (buffer_state.insert_position - start) / window_size,
+    }
     data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data)
+    return replay_buffer.write_rows(buffer_state, start, data), metrics
 
-    return data
+
+def reanalyze_buffer(
+    replay_buffer: replay_buffers.QueueBase,
+    buffer_state: ReplayBufferState,
+    key: jnp.ndarray,
+    forward: ForwardPass,
+    representation_fn: BaseRepresentationFn,
+    dynamics_fn: BaseDynamicsFn,
+    num_envs: int,
+) -> tuple[ReplayBufferState, Metrics]:
+    """Reanalyzes Config.reanalyze_windows_per_step uniformly drawn windows of
+    unroll_length x num_envs stored transitions (each with a stored successor)."""
+    window_size = Config.unroll_length * num_envs
+    num_windows = (buffer_state.insert_position - num_envs) // window_size
+    all_metrics = []
+    for _ in range(Config.reanalyze_windows_per_step):
+        key, key_window, unroll_key, bootstrap_key = jax.random.split(key, 4)
+        window = jax.random.randint(key_window, (), 0, jnp.maximum(num_windows, 1))
+        buffer_state, metrics = reanalyze_window(
+            replay_buffer,
+            buffer_state,
+            window * window_size,
+            forward,
+            representation_fn,
+            dynamics_fn,
+            unroll_key,
+            bootstrap_key,
+            Config.unroll_length,
+            num_envs,
+            Config.reanalyze_dirichlet_fraction,
+        )
+        all_metrics.append(metrics)
+    metrics = jax.tree_util.tree_map(lambda *x: jnp.mean(jnp.stack(x)), *all_metrics)
+    return buffer_state, metrics
+
+
+# ### END REANALYZE ##########################################################
 
 
 # Categorical supports: configurable range and resolution of the categorical
@@ -1732,107 +2007,6 @@ def compute_muzero_loss(
     representation_apply = az_network.representation_network.apply
     dynamics_apply = az_network.dynamics_network.apply
 
-    def reanalyze_policy(hidden_state):
-        prior_logits = policy_apply(jnp.zeros(1), params.policy, hidden_state)
-        value = value_apply(jnp.zeros(1), params.value, hidden_state)
-
-        root = mctx.RootFnOutput(
-            prior_logits=prior_logits,
-            value=value,
-            embedding=hidden_state,
-        )
-
-        def recurrent_fn(parameters, rng_key, action, embedding):
-            # environment (model)
-            reward, nstate = dynamics_apply(
-                jnp.zeros(1), params.dynamics, embedding, action
-            )
-            reward = jnp.squeeze(reward, axis=-1)
-
-            # policy & value networks
-            prior_logits = policy_apply(jnp.zeros(1), params.policy, nstate)
-            value = value_apply(jnp.zeros(1), params.value, nstate)
-
-            # Create the new MCTS node.
-            recurrent_fn_output = mctx.RecurrentFnOutput(
-                reward=reward,
-                # discount when terminal state reached
-                discount=Config.n_step_gamma * jnp.ones_like(reward),
-                # prior for the new state
-                prior_logits=prior_logits,
-                # value for the new state
-                value=value,
-            )
-
-            # Return the new node and the new environment.
-            return recurrent_fn_output, nstate
-
-        policy_output = mctx.sampled_muzero_policy(  # muzero_policy
-            params=(),
-            rng_key=rng,
-            root=root,
-            recurrent_fn=recurrent_fn,
-            num_simulations=Config.num_simulations,
-            dirichlet_fraction=0.25,
-            dirichlet_alpha=0.3,
-            pb_c_init=1.25,  # 1.25,
-            pb_c_base=19652,  # 19652,
-            temperature=1.0,
-        )
-
-        return policy_output.action_weights
-
-    def reanalyze_value(hidden_state):
-        prior_logits = policy_apply(jnp.zeros(1), params.policy, hidden_state)
-        value = value_apply(jnp.zeros(1), params.value, hidden_state)
-
-        root = mctx.RootFnOutput(
-            prior_logits=prior_logits,
-            value=value,
-            embedding=hidden_state,
-        )
-
-        def recurrent_fn(parameters, rng_key, action, embedding):
-            # environment (model)
-            reward, nstate = dynamics_apply(
-                jnp.zeros(1), params.dynamics, embedding, action
-            )
-            reward = jnp.squeeze(reward, axis=-1)
-
-            # policy & value networks
-            prior_logits = policy_apply(jnp.zeros(1), params.policy, nstate)
-            value = value_apply(jnp.zeros(1), params.value, nstate)
-
-            # Create the new MCTS node.
-            recurrent_fn_output = mctx.RecurrentFnOutput(
-                reward=reward,
-                # discount when terminal state reached
-                discount=jnp.ones_like(reward),
-                # prior for the new state
-                prior_logits=prior_logits,
-                # value for the new state
-                value=value,
-            )
-
-            # Return the new node and the new environment.
-            return recurrent_fn_output, nstate
-
-        policy_output = mctx.sampled_muzero_policy(  # muzero_policy
-            params=(),
-            rng_key=rng,
-            root=root,
-            recurrent_fn=recurrent_fn,
-            num_simulations=Config.num_simulations,
-            dirichlet_fraction=0.25,
-            dirichlet_alpha=0.3,
-            pb_c_init=1.25,  # 1.25,
-            pb_c_base=19652,  # 19652,
-            temperature=1.0,
-        )
-
-        return policy_output.search_tree.summary().value
-
-
     hidden = data.observation
     if shared_feature_extractor:
         feature_extractor_apply = az_network.feature_extractor.apply
@@ -1914,15 +2088,12 @@ def compute_muzero_loss(
         )
 
         # policy loss
-        # TODO NEW reanalyze
-        # policy_targets = reanalyze_policy(hidden_state=target_hidden)
         policy_loss = -jnp.sum(
             jax.lax.stop_gradient(policy_targets) * (jax.nn.log_softmax(policy_logits)),
             axis=-1,
         )
 
         # Value function loss
-        # TODO NEW reanalyzed value target
         # Value targets are the stored targets computed in training_step from
         # the MCTS search values (GAE(lambda) returns when use_gae=True, as in
         # alphazero.py). NOTE: recomputing the bootstrap value from the online
@@ -2409,15 +2580,6 @@ def main(_):
         optax.adam(learning_rate),
     )
 
-    if Config.use_gae:
-        n_step_fn = partial(
-            compute_gae, lambda_=Config.gae_lambda, discount=Config.n_step_gamma
-        )
-    else:
-        n_step_fn = partial(
-            n_step_bootstrapped_targets, n=Config.n_step_n, gamma=Config.n_step_gamma
-        )
-
     if Config.num_atoms > 1:
         value_loss_fn = partial(
             quantile_regression_loss, kappa=Config.qr_kappa, num_atoms=Config.num_atoms
@@ -2428,8 +2590,14 @@ def main(_):
         raise ValueError("num_atoms must be a positive integer.")
 
     if Config.reanalyze:
-        # TODO: reanalyze (see reanalyze()); not functional yet
-        raise NotImplementedError("reanalyze is not implemented yet")
+        # see reanalyze_window: windows of the buffer must be continuous
+        # trajectory blocks and reanalyze searches the learned model only
+        if not Config.learned_dynamics_search:
+            raise ValueError("reanalyze requires learned_dynamics_search = True")
+        if Config.num_resets_per_eval > 0:
+            raise ValueError("reanalyze requires num_resets_per_eval = 0")
+        if (max_replay_size // device_count) % (Config.num_envs // device_count):
+            raise ValueError("reanalyze requires max_replay_size % num_envs == 0")
 
     # create loss function via functools.partial
     loss_fn = partial(
@@ -2551,122 +2719,11 @@ def main(_):
         )
         return (optimizer_state, params, key), metrics
 
-    def replay_priorities(
-        targets: jnp.ndarray,
-        predicted_values: jnp.ndarray,
-        data: MuZeroTransition,
-        representation_fn: BaseRepresentationFn,
-        dynamics_fn: BaseDynamicsFn,
-    ) -> jnp.ndarray:
-        """(|value error| + w * |one-step reward error| + eps) ** alpha (reward-aware PER)."""
-        return (
-            jnp.mean(jnp.abs(targets - predicted_values), axis=-1)
-            + Config.per_reward_priority_weight
-            * reward_prediction_error(
-                representation_fn,
-                dynamics_fn,
-                data.observation,
-                data.action,
-                data.reward,
-            )
-            + Config.per_epsilon
-        ) ** Config.per_alpha
-
-    def process_unroll(
-        data: MuZeroTransition,
-        transition: MuZeroTransition,
-        representation_fn: BaseRepresentationFn,
-        dynamics_fn: BaseDynamicsFn,
-    ) -> tuple[MuZeroTransition, jnp.ndarray, jnp.ndarray]:
-        """Value targets, replay priorities and unroll targets for a fresh unroll
-        [T, B, ...]; `transition` is the extra search at the final state (bootstrap).
-        Returns (data, termination, truncation)."""
-        # split done into real termination and truncation (time limit)
-        termination, truncation = split_termination_truncation(
-            data.discount, data.extras["state_extras"]["truncation"]
-        )
-
-        (
-            value_prefix_targets,
-            bootstrap_observations,
-            bootstrap_values,
-            bootstrap_discounts,
-        ) = n_step_fn(
-            rewards=data.reward,
-            discounts=data.discount * (1 - data.extras["state_extras"]["truncation"]),
-            # GAE sees truncation separately and only cuts the lambda-chain there
-            termination_discount=1.0 - termination,
-            observations=data.next_observation,
-            values=jnp.concatenate(
-                [data.search_value, jnp.array([transition.search_value])]
-            ),
-        )
-
-        # NOTE: data.bootstap_value is overloaded with the prior values
-        targets = (
-            jnp.expand_dims(value_prefix_targets, -1)
-            + jnp.expand_dims(bootstrap_discounts, -1) * bootstrap_values
-        )
-        priorities = replay_priorities(
-            targets, data.bootstrap_value, data, representation_fn, dynamics_fn
-        )
-
-        data = data._replace(
-            value_prefix_target=value_prefix_targets,
-            bootstrap_observation=bootstrap_observations,
-            bootstrap_value=bootstrap_values,
-            bootstrap_discount=bootstrap_discounts,
-            priority=priorities,
-        )
-
-        # calculate targets per step for unrolling loss function
-        targets = (
-            data.observation,
-            data.target_policy_probs,
-            data.value_prefix_target,
-            data.bootstrap_discount,
-            data.bootstrap_value,
-            data.bootstrap_observation,
-            data.reward,
-            data.action,
-        )
-        (
-            unroll_obs,
-            policy_targets,
-            value_prefix_targets,
-            bootstrap_discounts,
-            bootstrap_values,
-            bootstrap_observations,
-            reward_targets,
-            unroll_actions,
-            unroll_mask,
-            terminal_mask,
-        ) = collect_targets(
-            targets,
-            termination,  # real termination only (absorbing states)
-            Config.loss_unroll_length,
-            truncation=truncation,
-        )
-
-        data = data._replace(
-            unroll_obs=unroll_obs,
-            policy_targets=policy_targets,
-            value_prefix_targets=value_prefix_targets,
-            bootstrap_discounts=bootstrap_discounts,
-            bootstrap_values=bootstrap_values,
-            bootstrap_observations=bootstrap_observations,
-            reward_targets=reward_targets,
-            unroll_actions=unroll_actions,
-            unroll_mask=unroll_mask,
-            terminal_mask=terminal_mask,
-        )
-        return data, termination, truncation
-
     def training_step(
         carry: tuple[TrainingState, State, ReplayBufferState, jnp.ndarray], unused_t
     ) -> tuple[tuple[TrainingState, State, ReplayBufferState, jnp.ndarray], Metrics]:
         training_state, state, buffer_state, key = carry
-        key_sgd, key_generate_unroll, key_bootstrap, _reanalyze_key, new_key = (
+        key_sgd, key_generate_unroll, key_bootstrap, reanalyze_key, new_key = (
             jax.random.split(key, 5)
         )
 
@@ -2713,7 +2770,7 @@ def main(_):
         assert data.discount.shape[0] == Config.unroll_length
 
         data, termination, truncation = process_unroll(
-            data, transition, representation_fn, dynamics_fn
+            data, transition.search_value, representation_fn, dynamics_fn
         )
 
         # search diagnostics from this unroll (acting time)
@@ -2749,9 +2806,6 @@ def main(_):
             [Config.unroll_length * Config.num_envs] + list(observation_shape),
         )
 
-        # NOTE we might want to keep the non-flattened data to keep episodes intact
-        # following muzeros further training stuff (re-analyze, GAE etc.)
-
         buffer_state = replay_buffer.insert(buffer_state, data)
 
         # Update normalization params and normalize observations.
@@ -2760,6 +2814,19 @@ def main(_):
             data.observation,
             pmap_axis_name=_PMAP_AXIS_NAME,
         )
+
+        # reanalyze stored windows with the acting networks of this step
+        if Config.reanalyze:
+            buffer_state, reanalyze_metrics = reanalyze_buffer(
+                replay_buffer,
+                buffer_state,
+                reanalyze_key,
+                forward_fn,
+                representation_fn,
+                dynamics_fn,
+                num_envs=state.obs.shape[0],
+            )
+            search_diagnostics.update(reanalyze_metrics)
 
         # sampling from replay buffer
         buffer_state, data = replay_buffer.sample(buffer_state)
@@ -2787,9 +2854,6 @@ def main(_):
             )
             data = data._replace(weight=data.weight**per_beta)
             search_diagnostics["per_beta"] = per_beta
-
-        # reanalyze
-        # data = reanalyze_fn(data, forward_fn, env, reanalyze_key)
 
         (optimizer_state, params, _), metrics = jax.lax.scan(
             partial(sgd_step, data=data, normalizer_params=normalizer_params),
@@ -2961,7 +3025,9 @@ def main(_):
 
         assert data.discount.shape[0] == num_prefill_actor_steps
 
-        data, _, _ = process_unroll(data, transition, representation_fn, dynamics_fn)
+        data, _, _ = process_unroll(
+            data, transition.search_value, representation_fn, dynamics_fn
+        )
 
         # Have leading dimensions (batch_size * num_minibatches, unroll_length)
         # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
