@@ -231,6 +231,119 @@ def make_representation_function(
     )
 
 
+# ### HISTORY GRU (muzero Config.representation_type = "gru"): recurrent
+# ### representation over the observation history of envs.pomdp_wrappers.
+# ### HistoryWrapper (flat [history_length * frame_size], oldest frame first,
+# ### last entry of each frame = valid flag). Frame encoder MLP -> GRU over the
+# ### frames -> MLP head with LayerNorm output, like make_representation_function.
+# ###   carry_size = 0: the GRU starts from a zero state at the oldest frame
+# ###       (memory = the window). A pure function of the stored observation.
+# ###   carry_size = R > 0 (muzero Config.rnn_carry_state): the observation is
+# ###       [carry0 (R), frames]; carry0 = GRU state before the oldest frame,
+# ###       computed when acting and stored with the transition (R2D2-style
+# ###       stored state; the window is the burn-in, with gradients through it).
+# ###       `advance` returns the next step's carry0 = one GRU step on the
+# ###       oldest frame. The GRU state stays zero on padding frames (valid 0).
+class HistoryGRU(linen.Module):
+    embedding_dim: int
+    encoder_layer_sizes: Sequence[int]
+    rnn_hidden_size: int
+    activation: ActivationFn = linen.relu
+    kernel_init: Initializer = jax.nn.initializers.lecun_uniform()
+
+    def setup(self):
+        self.encoder = (
+            MLP(
+                layer_sizes=tuple(self.encoder_layer_sizes),
+                activation=self.activation,
+                kernel_init=self.kernel_init,
+                activate_final=True,
+            )
+            if self.encoder_layer_sizes
+            else None
+        )
+        self.rnn = linen.GRUCell(features=self.rnn_hidden_size)
+        self.head = MLP(
+            layer_sizes=(self.embedding_dim,),
+            activation=self.activation,
+            kernel_init=self.kernel_init,
+            normalize_output=True,
+            activate_final=True,
+        )
+
+    def _step(self, carry, frame, valid):
+        x = frame if self.encoder is None else self.encoder(frame)
+        new_carry, _ = self.rnn(carry, x)
+        return jnp.where(valid[:, None] > 0.5, new_carry, jnp.zeros_like(new_carry))
+
+    def __call__(self, frames: jnp.ndarray, valid: jnp.ndarray, carry0: jnp.ndarray):
+        # frames [N, H, F] (normalized), valid [N, H] (raw 0/1), carry0 [N, R]
+        carry = carry0
+        for i in range(frames.shape[1]):  # H is small: unrolled
+            carry = self._step(carry, frames[:, i], valid[:, i])
+        return self.head(carry)
+
+    def advance(self, frames: jnp.ndarray, valid: jnp.ndarray, carry0: jnp.ndarray):
+        return self._step(carry0, frames[:, 0], valid[:, 0])
+
+
+def make_history_gru_representation_function(
+    obs_size: Sequence[int],
+    frame_size: int,
+    embedding_dim: int,
+    preprocess_observation_fn: Callable = identity_observation_preprocessor,
+    hidden_layer_sizes: Sequence[int] = (64, 64),
+    rnn_hidden_size: int = 64,
+    activation: ActivationFn = linen.relu,
+    carry_state: bool = False,
+) -> FeedForwardNetwork:
+    """GRU representation over a flat frame history (see HistoryGRU).
+
+    With carry_state the observation is [carry0 (rnn_hidden_size), frames] and the
+    returned network has an extra `advance(processor_params, params, obs)` giving
+    the next step's carry0."""
+    (flat_size,) = tuple(obs_size)
+    carry_size = rnn_hidden_size if carry_state else 0
+    assert (flat_size - carry_size) % frame_size == 0, (flat_size, carry_size, frame_size)
+    history_length = (flat_size - carry_size) // frame_size
+    module = HistoryGRU(
+        embedding_dim=embedding_dim,
+        encoder_layer_sizes=tuple(hidden_layer_sizes),
+        rnn_hidden_size=rnn_hidden_size,
+        activation=activation,
+    )
+
+    def split(processor_params, obs):
+        raw = jnp.reshape(obs, (-1, flat_size))
+        normalized = jnp.reshape(preprocess_observation_fn(obs, processor_params), (-1, flat_size))
+        frames = jnp.reshape(normalized[:, carry_size:], (-1, history_length, frame_size))
+        valid = jnp.reshape(raw[:, carry_size:], (-1, history_length, frame_size))[..., -1]
+        if carry_state:
+            carry0 = raw[:, :carry_size]  # raw, never normalized
+        else:
+            carry0 = jnp.zeros((raw.shape[0], rnn_hidden_size), raw.dtype)
+        return frames, valid, carry0
+
+    def apply(processor_params, representation_params, obs):
+        embedding = module.apply(representation_params, *split(processor_params, obs))
+        return jnp.reshape(embedding, obs.shape[:-1] + (embedding_dim,))
+
+    def advance(processor_params, representation_params, obs):
+        carry = module.apply(
+            representation_params, *split(processor_params, obs), method=HistoryGRU.advance
+        )
+        return jnp.reshape(carry, obs.shape[:-1] + (rnn_hidden_size,))
+
+    dummy = (
+        jnp.zeros((1, history_length, frame_size)),
+        jnp.ones((1, history_length)),
+        jnp.zeros((1, rnn_hidden_size)),
+    )
+    network = FeedForwardNetwork(init=lambda key: module.init(key, *dummy), apply=apply)
+    network.advance = advance
+    return network
+
+
 # TODO temp oracle test, undo
 def make_tmp_representation_function(
     obs_size: int,

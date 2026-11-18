@@ -34,6 +34,11 @@ from envs import (
 
 # from envs.brax_v1_wrappers import wrap_for_training
 from envs.brax_wrappers import EvalWrapper, VmapWrapper, wrap_for_training
+from envs.pomdp_wrappers import (
+    HistoryWrapper,
+    ObservationSubsetWrapper,
+    RecurrentStateSlotWrapper,
+)
 from gymnax import gymnax
 from gymnax.gymnax.wrappers.brax import GymnaxToBraxWrapper, State
 from networks.distributions import (
@@ -46,6 +51,7 @@ from networks.networks import (
     ActivationFn,
     FeedForwardNetwork,
     make_dynamics_network,
+    make_history_gru_representation_function,
     make_policy_network,
     make_representation_function,
     make_value_network,
@@ -68,6 +74,27 @@ class Config:
     num_envs = 16
     normalize_observations = True
     action_repeat = 1
+
+    # ### PARTIAL OBSERVABILITY / MEMORY (envs/pomdp_wrappers.py, README "Partial
+    # ### observability"). All off by default (env unchanged, bit-identical).
+    # keep only these observation entries; None = full observation. Acrobot
+    # without the angular velocities (POMDP): (0, 1, 2, 3)
+    observation_indices: Sequence[int] | None = None
+    # history stacking as in MuZero: the observation becomes the last
+    # history_length frames [obs, one-hot previous action, valid flag]. 1 = off
+    history_length: int = 1
+    history_actions: bool = True
+    # representation over the observation: "mlp" (MLP on the flat input, with
+    # history_length > 1 = MuZero's stacked history) or "gru" (GRU over the
+    # history_length frames, needs history_length > 1)
+    representation_type: str = "mlp"
+    rnn_hidden_size: int = 64
+    # "gru" only: carry the GRU state through the episode (memory beyond the
+    # window). The state before the oldest window frame is stored with every
+    # transition and the representation runs from it through the window
+    # (R2D2-style stored state, the window is the burn-in, with gradients).
+    # history_length >= 1; needs learned_dynamics_search, no planning_diagnostics
+    rnn_carry_state: bool = False
     eval_env = True
     num_resets_per_eval = 0
     eval_every = 20
@@ -351,6 +378,18 @@ def make_forward_fn(az_networks: AZNetworks | AtariAZNetworks):
     return make_forward
 
 
+class RecurrentRepresentation:
+    """representation_fn(obs) -> embedding, plus advance(obs) -> next stored
+    GRU state (Config.rnn_carry_state)."""
+
+    def __init__(self, representation_fn, advance):
+        self._representation_fn = representation_fn
+        self.advance = advance
+
+    def __call__(self, observations):
+        return self._representation_fn(observations)
+
+
 def make_representation_fn(az_networks: AZNetworks | AtariAZNetworks):
     """Creates params and inference function for the agent."""
 
@@ -367,6 +406,15 @@ def make_representation_fn(az_networks: AZNetworks | AtariAZNetworks):
             )
             return hidden_state
 
+        # ### CARRIED GRU STATE: the representation also gives the next step's
+        # ### stored GRU state (used by actor_step)
+        if hasattr(representation_network, "advance"):
+            advance = jax.jit(
+                lambda observations: representation_network.advance(
+                    normalizer_params, representation_params, observations
+                )
+            )
+            return RecurrentRepresentation(representation_fn, advance)
         return representation_fn
 
     return make_representation
@@ -429,13 +477,32 @@ def make_az_networks(
         )
     # representation: MLP with LayerNorm output; policy / value / dynamics
     # operate on the embedding
-    representation_network = make_representation_function(
-        obs_size=observation_size,
-        embedding_dim=embedding_size,
-        preprocess_observation_fn=preprocess_observation_fn,
-        hidden_layer_sizes=representation_hidden_layer_sizes,
-        activation=activation,
-    )
+    if Config.representation_type == "gru":
+        # ### HISTORY GRU: recurrent representation over the frame history
+        representation_network = make_history_gru_representation_function(
+            obs_size=observation_size,
+            frame_size=(
+                observation_size[-1]
+                - (Config.rnn_hidden_size if Config.rnn_carry_state else 0)
+            )
+            // Config.history_length,
+            embedding_dim=embedding_size,
+            preprocess_observation_fn=preprocess_observation_fn,
+            hidden_layer_sizes=representation_hidden_layer_sizes,
+            rnn_hidden_size=Config.rnn_hidden_size,
+            activation=activation,
+            carry_state=Config.rnn_carry_state,
+        )
+    elif Config.representation_type == "mlp":
+        representation_network = make_representation_function(
+            obs_size=observation_size,
+            embedding_dim=embedding_size,
+            preprocess_observation_fn=preprocess_observation_fn,
+            hidden_layer_sizes=representation_hidden_layer_sizes,
+            activation=activation,
+        )
+    else:
+        raise ValueError(f"unknown representation_type {Config.representation_type!r}")
     hidden_size = (embedding_size,)
     dynamics_network = make_dynamics_network(
         embedding_size=hidden_size[0],
@@ -603,7 +670,12 @@ def actor_step(
     key, _logits_rng, search_rng = jax.random.split(key, 3)  # (keeps the rng streams)
 
     # logits at root produced by the prior policy
-    root_embedding = representation_fn(env_state.obs)
+    obs, real_obs = env_state.obs, env_state.real_obs
+    if Config.rnn_carry_state:
+        # ### CARRIED GRU STATE: agent observation = [stored GRU state, frames]
+        obs = jnp.concatenate([env_state.info["rnn_carry"], env_state.obs], axis=-1)
+        real_obs = obs
+    root_embedding = representation_fn(obs)
     prior_logits, value = forward(root_embedding)
 
     policy_output = run_search(
@@ -656,28 +728,38 @@ def actor_step(
     }
 
     nstate = env.step(env_state, actions)
+    next_observation = nstate.real_obs
+    if Config.rnn_carry_state:
+        # ### CARRIED GRU STATE: next stored state = one GRU step on the oldest
+        # ### frame; zero where the episode ended (the next obs is a reset)
+        next_carry = representation_fn.advance(obs)
+        next_observation = jnp.concatenate([next_carry, nstate.real_obs], axis=-1)
+        ended = jnp.reshape(nstate.done, nstate.done.shape + (1,)) > 0
+        nstate = nstate.replace(
+            info={**nstate.info, "rnn_carry": jnp.where(ended, 0.0, next_carry)}
+        )
     batch_shape = nstate.reward.shape
     state_extras = {x: nstate.info[x] for x in extra_fields}
     return (
         nstate,
         MuZeroTransition(  # pytype: disable=wrong-arg-types  # jax-ndarray
-            observation=env_state.obs,
-            real_obs=env_state.real_obs,
+            observation=obs,
+            real_obs=real_obs,
             action=actions,
             reward=nstate.reward,
             discount=1 - nstate.done,
-            next_observation=nstate.real_obs,  # nstate.obs
+            next_observation=next_observation,  # nstate.obs
             target_policy_probs=action_weights,
             search_value=search_value,
             value_prefix_target=jnp.zeros_like(nstate.reward),
-            bootstrap_observation=jnp.zeros_like(env_state.obs),
+            bootstrap_observation=jnp.zeros_like(obs),
             bootstrap_value=value,  # NOTE: we overload here to save space
             bootstrap_discount=jnp.ones_like(1 - nstate.done),
             extras={"policy_extras": policy_extras, "state_extras": state_extras},
             priority=jnp.ones_like(nstate.done),
             weight=jnp.ones_like(nstate.done),
             unroll_obs=jnp.zeros(
-                batch_shape + (Config.loss_unroll_length,) + env_state.obs.shape[1:]
+                batch_shape + (Config.loss_unroll_length,) + obs.shape[1:]
             ),
             policy_targets=jnp.zeros(
                 batch_shape + (Config.loss_unroll_length, action_weights.shape[-1])
@@ -688,7 +770,7 @@ def actor_step(
                 batch_shape + (Config.loss_unroll_length,) + value.shape[1:]
             ),
             bootstrap_observations=jnp.zeros(
-                batch_shape + (Config.loss_unroll_length,) + env_state.obs.shape[1:]
+                batch_shape + (Config.loss_unroll_length,) + obs.shape[1:]
             ),
             reward_targets=jnp.zeros(
                 batch_shape + (Config.loss_unroll_length,) + nstate.reward.shape[1:]
@@ -2414,6 +2496,37 @@ def main(_):
             "Currently only discrete action spaces are supported."
         )
     environment = GymnaxToBraxWrapper(environment)
+    # ### PARTIAL OBSERVABILITY / MEMORY: applied below the Episode / AutoReset
+    # ### wrappers, so auto-resets reset the history; the true-env search
+    # ### (model_rollout_env) and the evaluators use the same wrapped env
+    if Config.observation_indices is not None:
+        environment = ObservationSubsetWrapper(environment, Config.observation_indices)
+    if (
+        Config.representation_type == "gru"
+        and Config.history_length < 2
+        and not Config.rnn_carry_state
+    ):
+        raise ValueError("representation_type 'gru' requires history_length > 1")
+    if Config.rnn_carry_state:
+        if Config.representation_type != "gru":
+            raise ValueError("rnn_carry_state requires representation_type 'gru'")
+        if not Config.learned_dynamics_search or Config.planning_diagnostics:
+            # the true-env search and the diagnostics compute embeddings of env
+            # states without the agent's recurrent state
+            raise ValueError(
+                "rnn_carry_state requires learned_dynamics_search = True and "
+                "planning_diagnostics = False"
+            )
+    use_history = Config.history_length > 1 or Config.representation_type == "gru"
+    if use_history:
+        environment = HistoryWrapper(
+            environment,
+            Config.history_length,
+            num_actions=environment.action_size(),
+            include_actions=Config.history_actions,
+        )
+    if Config.rnn_carry_state:
+        environment = RecurrentStateSlotWrapper(environment, Config.rnn_hidden_size)
 
     env = wrap_for_training(
         environment,
@@ -2433,6 +2546,10 @@ def main(_):
         observation_shape = env_state.obs.shape[-3:]
     else:
         observation_shape = env_state.obs.shape[-1:]
+    window_size = observation_shape[-1]
+    if Config.rnn_carry_state:
+        # ### CARRIED GRU STATE: stored observation = [GRU state, frames]
+        observation_shape = (Config.rnn_hidden_size + window_size,)
 
     # intialize replay buffer
     dummy_obs = jnp.zeros(
@@ -2511,6 +2628,23 @@ def main(_):
     normalize = lambda x, y: x
     if Config.normalize_observations:
         normalize = running_statistics.normalize
+        if use_history:
+            # ### HISTORY NORMALIZATION: normalize only the observation entries
+            # ### of each frame; the action one-hot, the valid flag (rarely 0,
+            # ### so its running std is tiny) and the stored GRU state stay raw
+            frame_size = window_size // Config.history_length
+            obs_dim = frame_size - 1 - (action_size if Config.history_actions else 0)
+            frame_mask = jnp.arange(frame_size) < obs_dim
+            norm_mask = jnp.tile(frame_mask, Config.history_length)
+            if Config.rnn_carry_state:
+                norm_mask = jnp.concatenate(
+                    [jnp.zeros(Config.rnn_hidden_size, bool), norm_mask]
+                )
+
+            def normalize(x, normalizer_params):
+                return jnp.where(
+                    norm_mask, running_statistics.normalize(x, normalizer_params), x
+                )
 
     az_network = make_az_networks(
         observation_size=observation_shape,  # NOTE only works with flattened observation space
